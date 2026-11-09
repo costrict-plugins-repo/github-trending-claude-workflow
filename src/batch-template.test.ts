@@ -1,0 +1,226 @@
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Executor } from "./executor.js";
+import { Loader } from "./loader.js";
+import { writeToolReason } from "./read-only-gate.js";
+import type { StateDefinition } from "./types.js";
+
+// The bundled batch-task's default extension points, run as shell against a real repo. The pool is
+// left out (resource stripped) and wf-queue is a stub printing $LAND_TEST: the queue CLI has its own tests.
+const TEMPLATES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "templates");
+const dirs: string[] = [];
+afterEach(() => {
+  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
+
+function tmp(): string {
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "wf-batch-")));
+  dirs.push(d);
+  return d;
+}
+
+const git = (cwd: string, ...args: string[]): string =>
+  execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], {
+    cwd,
+    encoding: "utf8",
+  }).trim();
+
+function state(name: string, landTest: string, plugin: string): StateDefinition {
+  const empty = tmp();
+  const def = new Loader(TEMPLATES, empty, null).get("batch-task")!.states[name];
+  return {
+    ...def,
+    resource: undefined,
+    env: { ...def.env, WF_PLUGIN_ROOT: plugin, LAND_TEST: landTest },
+  };
+}
+
+function setup(): { repo: string; plugin: string; vars: Record<string, unknown> } {
+  const root = tmp();
+  const repo = path.join(root, "proj");
+  fs.mkdirSync(repo);
+  git(repo, "init", "-q", "-b", "main");
+  // The template's own `git merge --no-ff` commits too: a CI runner has no global identity.
+  git(repo, "config", "user.name", "t");
+  git(repo, "config", "user.email", "t@t");
+  fs.writeFileSync(path.join(repo, "a.txt"), "a\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-qm", "init");
+  const plugin = path.join(root, "plugin");
+  fs.mkdirSync(path.join(plugin, "scripts"), { recursive: true });
+  fs.writeFileSync(
+    path.join(plugin, "scripts", "wf-queue"),
+    '#!/bin/sh\nprintf %s "$LAND_TEST"\n',
+    {
+      mode: 0o755,
+    },
+  );
+  const vars = { context: { task: "T1", cwd: repo, queue_file: path.join(root, "q.md") } };
+  return { repo, plugin, vars };
+}
+
+describe("batch-task default extension points", () => {
+  it("prepare makes the worktree beside the repo; land merges --no-ff and runs land_test", async () => {
+    const { repo, plugin, vars } = setup();
+    const ex = new Executor();
+    const prep = await ex.execute(state("project_prepare", "", plugin), vars, { cwd: repo });
+    expect(prep.exit_code).toBe(0);
+    const wt = path.join(path.dirname(repo), ".wt", "proj", "T1");
+    expect(prep.stdout).toBe(wt);
+    fs.writeFileSync(path.join(wt, "b.txt"), "b\n");
+    git(wt, "add", ".");
+    git(wt, "commit", "-qm", "work");
+    const land = await ex.execute(state("project_land", "test -f b.txt", plugin), vars, {
+      cwd: repo,
+    });
+    expect(land.exit_code).toBe(0);
+    expect(land.stdout).toMatch(/landed batch\/T1: [0-9a-f]+/);
+    expect(git(repo, "log", "-1", "--format=%P").split(" ")).toHaveLength(2);
+    const again = await ex.execute(state("project_prepare", "", plugin), vars, { cwd: repo });
+    expect(again.stderr).toContain(`kept ${wt}`);
+  });
+
+  it("a failed land_test takes the merge back; a dirty repo is refused before any merge", async () => {
+    const { repo, plugin, vars } = setup();
+    const ex = new Executor();
+    const wt = (await ex.execute(state("project_prepare", "", plugin), vars, { cwd: repo })).stdout;
+    fs.writeFileSync(path.join(wt, "b.txt"), "b\n");
+    git(wt, "add", ".");
+    git(wt, "commit", "-qm", "work");
+    const head = git(repo, "rev-parse", "HEAD");
+    const red = await ex.execute(state("project_land", "echo boom; exit 4", plugin), vars, {
+      cwd: repo,
+    });
+    expect(red.exit_code).toBe(1);
+    expect(red.stdout).toContain("boom");
+    expect(red.stdout).toContain("land_test failed (exit 4)");
+    expect(git(repo, "rev-parse", "HEAD")).toBe(head);
+    fs.writeFileSync(path.join(repo, "a.txt"), "dirty\n");
+    const dirty = await ex.execute(state("project_land", "", plugin), vars, { cwd: repo });
+    expect(dirty.exit_code).toBe(3);
+    expect(git(repo, "rev-parse", "HEAD")).toBe(head);
+  });
+  it("review_scope classes the task's branch by the plugin's review-class.sh: tests/docs only = light, else code", async () => {
+    const { repo, plugin, vars } = setup();
+    const real = path.resolve(TEMPLATES, "..");
+    const ex = new Executor();
+    const wt = (await ex.execute(state("project_prepare", "", plugin), vars, { cwd: repo })).stdout;
+    const scope = () => ex.execute(state("review_scope", "", real), vars, { cwd: repo });
+    const empty = await scope();
+    expect([empty.exit_code, empty.stdout.trim()]).toEqual([0, "code"]);
+    expect(empty.stderr).toContain("changes nothing");
+    fs.mkdirSync(path.join(wt, "test"));
+    fs.writeFileSync(path.join(wt, "test", "a.test.ts"), "t\n");
+    fs.writeFileSync(path.join(wt, "NOTES.md"), "n\n");
+    git(wt, "add", ".");
+    git(wt, "commit", "-qm", "tests and docs");
+    const light = await scope();
+    expect([light.exit_code, light.stdout.trim()]).toEqual([0, "light"]);
+    fs.writeFileSync(path.join(wt, "main.ts"), "m\n");
+    git(wt, "add", ".");
+    git(wt, "commit", "-qm", "code");
+    // main moved on meanwhile: only the branch's side since the merge base counts
+    fs.writeFileSync(path.join(repo, "other.ts"), "o\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-qm", "main moved");
+    const code = await scope();
+    expect([code.exit_code, code.stdout.trim()]).toEqual([0, "code"]);
+    expect(code.stderr).toContain("main.ts");
+    expect(code.stderr).not.toContain("other.ts");
+  });
+
+  it("review-class.sh: a nested docs/ or spec/ package and a .txt build file are code; root docs, tests anywhere, *.md are light", () => {
+    const { repo } = setup();
+    const script = path.resolve(TEMPLATES, "..", "scripts", "review-class.sh");
+    const cases: [string, string][] = [
+      ["docs/guide.md", "light"],
+      ["docs/api.html", "light"],
+      ["src/tests/a.ts", "light"],
+      ["src/__tests__/b.ts", "light"],
+      ["src/x.test.ts", "light"],
+      ["src/FooTest.hx", "light"],
+      ["CHANGELOG", "light"],
+      ["CMakeLists.txt", "code"],
+      ["requirements.txt", "code"],
+      ["src/doc/Printer.x", "code"],
+      ["src/spec/Typer.x", "code"],
+      ["src/check/common/docs/Rule.hx", "code"],
+    ];
+    for (const [file, want] of cases) {
+      const branch = `c${cases.findIndex(c => c[0] === file)}`;
+      git(repo, "checkout", "-q", "-b", branch, "main");
+      fs.mkdirSync(path.join(repo, path.dirname(file)), { recursive: true });
+      fs.writeFileSync(path.join(repo, file), "x\n");
+      git(repo, "add", ".");
+      git(repo, "commit", "-qm", file);
+      git(repo, "checkout", "-q", "main");
+      const got = execFileSync("sh", [script, "main", branch], {
+        cwd: repo,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      expect([file, got]).toEqual([file, want]);
+    }
+  });
+
+  it("a red land_test keeps an edit made meanwhile; a HEAD moved during the test is never reset (4)", async () => {
+    const { repo, plugin, vars } = setup();
+    const ex = new Executor();
+    const land = (cmd: string) =>
+      ex.execute(state("project_land", cmd, plugin), vars, { cwd: repo });
+    const wt = (await ex.execute(state("project_prepare", "", plugin), vars, { cwd: repo })).stdout;
+    fs.writeFileSync(path.join(wt, "b.txt"), "b\n");
+    git(wt, "add", ".");
+    git(wt, "commit", "-qm", "work");
+    const head = git(repo, "rev-parse", "HEAD");
+    const edited = await land("echo mine > a.txt; exit 5");
+    expect(edited.exit_code).toBe(1);
+    expect(git(repo, "rev-parse", "HEAD")).toBe(head);
+    expect(fs.readFileSync(path.join(repo, "a.txt"), "utf8")).toBe("mine\n");
+    git(repo, "checkout", "-q", "--", "a.txt");
+    const moved = await land(
+      "git -c user.name=t -c user.email=t@t commit -q --allow-empty -m x; exit 1",
+    );
+    expect(moved.exit_code).toBe(4);
+    expect(moved.stdout).toContain("HEAD moved during land_test: nothing taken back");
+    expect(git(repo, "log", "-1", "--format=%s")).toBe("x");
+    expect(git(repo, "log", "-1", "--format=%s", "HEAD~1")).toMatch(/^Merge branch 'batch\/T1'/);
+  });
+});
+
+describe("bundled batch: stale tasks", () => {
+  it("collect lists the run's stale sessions; paused waits for the user and is never stale", () => {
+    const batch = new Loader(TEMPLATES, tmp(), null).get("batch")!;
+    expect(batch.states.collect.prompt).toContain("{{stale_sessions}}");
+    expect(batch.states.paused.stale_after).toBe(0);
+  });
+});
+
+describe("bundled batch-task: the reviewer is the read-only type", () => {
+  const review = (): string =>
+    new Loader(TEMPLATES, tmp(), null).get("batch-task")!.states.review.prompt;
+
+  it("review spawns workflow:reviewer, starts no session for it and names no workflow tool use", () => {
+    const p = review().replace(/\s+/g, " ");
+    expect(p).toContain('Spawn ONE reviewer: Agent, `subagent_type: "workflow:reviewer"`');
+    expect(p).toContain("call no workflow tool");
+    expect(p).toContain("the change's working tree is {{context.wt}}: read the sources there");
+    expect(p).not.toContain("your batch");
+    expect(p).toContain("Your LAST step is ONE SubagentHandback call");
+    expect(p).not.toMatch(/file-review|review_session|session_id: "?R/);
+  });
+
+  it("the review file the prompt names is a path the read-only Write gate accepts; a log dir beside the worktree is not", () => {
+    const m = review().match(/(\/tmp\/wf-batch-logs\/\{\{context\.task\}\}\/review\.md)/);
+    expect(m).not.toBeNull();
+    const file = m![1].replace("{{context.task}}", "T1");
+    expect(writeToolReason(file)).toBeUndefined();
+    expect(writeToolReason("/Users/x/dev/.wt/repo/T1.log/review.md")).toMatch(/outside the report/);
+    expect(review()).not.toContain("{{context.wt}}.log/review.md");
+  });
+});

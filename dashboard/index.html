@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MCP Workflow Engine</title>
+<link rel="stylesheet" href="/tokens.css">
+<link rel="stylesheet" href="/components.css">
+</head>
+<body>
+<div class="container">
+  <h1>MCP Workflow Engine</h1>
+  <div class="tabs">
+    <a href="/sessions" id="tab-sessions">Sessions</a>
+    <a href="/workflows" id="tab-workflows">Workflows</a>
+    <a href="/plan" id="tab-plan">Plan</a>
+    <a href="/timeline" id="tab-timeline">Timeline</a>
+    <a href="/pool" id="tab-pool">Pool</a>
+    <a href="/cost" id="tab-cost">Cost</a>
+    <a href="/map" id="tab-map">Map</a>
+  </div>
+  <div id="map-view" style="display:none"></div>
+  <div id="cost-view" style="display:none"><div class="panel"><h2 class="label">Cost</h2><div id="cost-content"><div class="empty">No cost</div></div></div></div>
+  <div id="pool-view" style="display:none"><div class="panel"><h2 class="label">Pool</h2><div id="pool-content"><div class="empty">No pool</div></div></div></div>
+  <div id="timeline-view" style="display:none"><div class="panel"><h2 class="label">Timeline</h2><div id="timeline-content"><div class="empty">No pipelines</div></div></div></div>
+  <div id="plan-view" style="display:none"><div class="plan-cols" id="plan-cols"><div class="panel"><h2 class="label">Plan</h2><div id="plan-content"><div class="empty">No queue</div></div></div><div class="panel plan-card" id="plan-card" style="display:none"></div></div></div>
+  <div id="main-view">
+  <div class="grid">
+    <div class="stack-col">
+      <div class="panel" id="sessions-panel">
+        <h2 class="label">Sessions</h2>
+        <div id="sessions-list"><div class="empty">No active sessions</div></div>
+      </div>
+      <div class="panel" id="workflows-panel">
+        <h2 class="label">Workflows</h2>
+        <div id="workflows-list"><div class="empty">No workflows loaded</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="panel" id="detail-panel">
+        <h2 class="label">Session Detail</h2>
+        <div id="detail-content"><div class="empty">Select a session</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<div class="indicator" id="refresh-indicator">Auto-refresh: 2s</div>
+
+<script src="/dagre.min.js"></script>
+<script>
+let selectedSessionId = null;
+let Routes = null; // /routes.js (src/dashboard-routes.ts), imported before the first render
+let route = { view: 'sessions' };
+let shownWorkflow = null;
+let allWorkflows = {};
+let allSessions = [];
+let liveMap = null; // /map.js (the live workflow map), imported when the Map tab first opens
+let Layout = null; // /map-layout.js (difficultyBar: the one difficulty plaque), imported before the first render
+let Stable = null; // /stable.js (in-place refresh, scroll memory), imported before the first render
+
+// Every refresh on a timer takes its markup into the live node in place: scroll, focus and selection stay.
+function put(id, html) {
+  Stable.patchHtml(document.getElementById(id), html);
+}
+
+async function fetchJSON(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// The shared components (dashboard/components.css): every view builds its markup from these and
+// reaches a colour only through a class or an inline `--c` naming a token — never a literal.
+const EFFORT_BARS = { low: 1, medium: 2, high: 3, xhigh: 4, max: 4 };
+
+function modelClass(model) {
+  const m = String(model || '').toLowerCase();
+  for (const name of ['haiku', 'sonnet', 'opus']) if (m.includes(name)) return name;
+  return '';
+}
+
+function actorClass(name) {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+  return 'actor-' + (Math.abs(hash) % 8);
+}
+
+const ui = {
+  label: (html, gap) => `<h2 class="label${gap ? ' gap' : ''}">${html}</h2>`,
+  empty: (text, tight) => `<div class="empty${tight ? ' tight' : ''}">${text}</div>`,
+  // A pill with a 2 px border in the state colour (cls: st-run / st-wait / st-stop / st-done / st-pool) or a token.
+  plaque: (text, cls, color) => `<span class="plaque${cls ? ' ' + cls : ''}"${color ? ` style="--c:var(${color})"` : ''}>${text}</span>`,
+  // The five-cell difficulty bar, first in every row that has a difficulty (`?????` when unknown, so columns align).
+  difficulty(d) {
+    const b = Layout.difficultyBar(d);
+    return `<span class="diffbar${b.token === '--text-4' ? ' unknown' : ''}" style="--c:var(${b.token})">${b.text}</span>`;
+  },
+  // The kind mark, right after the difficulty bar: Layout.kindMark answers it (a blank cell for no line).
+  kind(line) {
+    return `<span class="kindmark">${Layout.kindMark(line)}</span>`;
+  },
+  // model ▮▮▮▯ effort · role
+  chip(model, effort, role) {
+    const n = EFFORT_BARS[String(effort || '').toLowerCase()];
+    const bars = n ? `<span class="bars">${'▮'.repeat(n)}${'▯'.repeat(4 - n)}</span> ${escapeHtml(effort)}` : '';
+    const roleHtml = role ? `<span class="role">· ${escapeHtml(role)}</span>` : '';
+    return `<span class="chip ${modelClass(model)}">${escapeHtml(model)}${bars ? ' ' + bars : ''}${roleHtml ? ' ' + roleHtml : ''}</span>`;
+  },
+  dot: kind => `<span class="dot${kind ? ' ' + kind : ''}"></span>`,
+  square: () => '<span class="sq"></span>',
+  // `next: … +N` / `landed earlier: … +N`
+  strip(lead, plaquesHtml, hidden, cls) {
+    if (!plaquesHtml.length) return '';
+    return `<div class="strip${cls ? ' ' + cls : ''}"><span class="lead">${lead}</span>${plaquesHtml.join('')}${hidden > 0 ? `<span class="more">+${hidden}</span>` : ''}</div>`;
+  },
+  // A list row (session, workflow, plan line): a link when it has an href.
+  item({ href, active, title, id, info, extra, pick }) {
+    const open = href ? `<a class="item${active ? ' active' : ''}" href="${href}">`
+      : pick ? `<div class="item pick${active ? ' active' : ''}" data-key="plan:${escapeHtml(pick)}" data-plan-id="${escapeHtml(pick)}">` : '<div class="item">';
+    return open
+      + `<div class="title">${title}</div>`
+      + (id ? `<div class="id">${escapeHtml(id)}</div>` : '')
+      + (info ? `<div class="info">${info}</div>` : '')
+      + (extra ? `<div class="info">${extra}</div>` : '')
+      + (href ? '</a>' : '</div>');
+  },
+  frame: (html, active, cls) => `<div class="frame${active ? ' active-frame' : ''}${cls ? ' ' + cls : ''}">${html}</div>`,
+  transition: (name, target) => `<div class="transition">${escapeHtml(name)} <span class="arrow">→</span> ${escapeHtml(target)}</div>`,
+  box: (text, label) => (label ? `<div class="box-label">${label}</div>` : '') + `<div class="box">${escapeHtml(text)}</div>`,
+  kv: (key, valueHtml) => `<div class="kv"><span class="key">${escapeHtml(key)}</span>: <span class="val">${valueHtml}</span></div>`,
+};
+
+// The model a running session works with: the first context.model_* naming one ('' = the default colour).
+function sessionModel(s) {
+  const model = Object.entries(s.context || {}).find(([k, v]) => k.startsWith('model_') && modelClass(v));
+  return model ? modelClass(model[1]) : '';
+}
+
+// A session reads the same state colour in every view.
+function sessionState(s) {
+  if (s.stack.length === 0)
+    return s.outcome === 'abandoned' ? { cls: 'st-stop', text: 'abandoned' } : { cls: 'st-done', text: 'done' };
+  // The step's exec waits for a pool lease past the pool's starve_after: waiting on the pool.
+  if (s.pool_starved) return { cls: 'st-pool', text: 'waiting for pool', live: 'pool' };
+  // The active step is a question to the parent (a state tagged `ask: parent`): waiting on the parent.
+  const frame = s.stack[s.active_frame];
+  if (allWorkflows[frame?.workflow]?.states?.[frame.current_state]?.ask === 'parent')
+    return { cls: 'st-wait', text: 'waiting for parent', live: '' };
+  return { cls: 'st-run ' + sessionModel(s), text: 'active', live: sessionModel(s) };
+}
+
+// The agents a session's stages run: model_<stage> / effort_<stage> from its context, one chip per stage.
+function agentChips(s) {
+  const chips = Object.entries(s.context || {})
+    .filter(([k, v]) => /^model_.+/.test(k) && typeof v === 'string' && v)
+    .map(([k, v]) => ui.chip(v, s.context['effort_' + k.slice(6)], k.slice(6)));
+  return chips.length ? `<div class="agents">${chips.join('')}</div>` : '';
+}
+
+async function refresh() {
+  const [sessions, workflows] = await Promise.all([
+    fetchJSON('/api/sessions'),
+    fetchJSON('/api/workflows'),
+  ]);
+
+  const indicator = document.getElementById('refresh-indicator');
+  if (sessions === null && workflows === null) {
+    indicator.textContent = 'Reconnecting...';
+    indicator.classList.add('bad');
+    return;
+  }
+  indicator.textContent = 'Auto-refresh: 2s';
+  indicator.classList.remove('bad');
+
+  allSessions = sessions || [];
+  allWorkflows = workflows || {};
+  renderSessions(allSessions);
+  renderWorkflows(workflows || {});
+
+  if (selectedSessionId) {
+    const session = (sessions || []).find(s => s.session_id === selectedSessionId);
+    if (session) renderDetail(session);
+    else put('detail-content', ui.empty('Session not found'));
+  } else if (route.view === 'workflow' && shownWorkflow !== route.name && workflows) {
+    if (allWorkflows[route.name]) showWorkflowGraph(route.name);
+    else put('detail-content', ui.empty('Workflow not found'));
+  }
+}
+
+function getDisplayName(s) {
+  if (s.context?.display_name) return s.context.display_name;
+  if (s.context?.cwd) return s.context.cwd.split('/').pop();
+  return s.session_id.slice(0, 8);
+}
+
+function getAgentBadge(s) {
+  const startEntry = s.history?.find(h => h.event === 'start');
+  const actor = startEntry?.actor;
+  if (!actor) return '';
+  return ui.plaque(escapeHtml(actor), '', '--sub');
+}
+
+function renderSessionItem(s, depth = 0) {
+  const isActive = s.stack.length > 0;
+  const frame = isActive ? s.stack[s.active_frame] : null;
+  const stateInfo = frame ? `${frame.workflow} @ ${frame.current_state}` : (s.outcome || 'completed');
+  const state = sessionState(s);
+  const badges = [
+    ui.plaque(state.text, state.cls),
+    getAgentBadge(s),
+    s.stack.length > 1 ? ui.plaque(`depth: ${s.stack.length}`, 'st-wait') : '',
+    s.parent_session_id ? ui.plaque('child', '', '--sub') : '',
+  ].join('');
+  const indent = depth > 0 ? `<div style="margin-left:${depth * 20}px">` : '<div>';
+  return indent + ui.item({
+    href: `/session/${encodeURIComponent(s.session_id)}`,
+    active: s.session_id === selectedSessionId,
+    title: `${escapeHtml(getDisplayName(s))} ${badges}`,
+    id: s.session_id,
+    info: escapeHtml(stateInfo),
+  }) + '</div>';
+}
+
+function buildChildrenMap(sessions) {
+  const map = {};
+  for (const s of sessions)
+    if (s.parent_session_id) {
+      if (!map[s.parent_session_id]) map[s.parent_session_id] = [];
+      map[s.parent_session_id].push(s);
+    }
+  return map;
+}
+
+function renderSessionTree(session, childrenMap, depth) {
+  let html = renderSessionItem(session, depth);
+  const children = childrenMap[session.session_id] || [];
+  for (const child of children)
+    html += renderSessionTree(child, childrenMap, depth + 1);
+  return html;
+}
+
+function renderSessions(sessions) {
+  if (sessions.length === 0) {
+    put('sessions-list', ui.empty('No active sessions'));
+    return;
+  }
+
+  const childrenMap = buildChildrenMap(sessions);
+  const childIds = new Set(sessions.filter(s => s.parent_session_id).map(s => s.session_id));
+
+  const active = sessions.filter(s => s.stack.length > 0 && !childIds.has(s.session_id));
+  const inactive = sessions.filter(s => s.stack.length === 0 && !childIds.has(s.session_id));
+  inactive.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const abandoned = inactive.filter(s => s.outcome === 'abandoned');
+  const completed = inactive.filter(s => s.outcome !== 'abandoned');
+  const recentAbandoned = abandoned.slice(0, 3);
+  const recentCompleted = completed.slice(0, 3);
+
+  let html = '';
+
+  if (active.length > 0)
+    html += active.map(s => renderSessionTree(s, childrenMap, 0)).join('');
+  else
+    html += ui.empty('No active sessions', true);
+
+  if (recentAbandoned.length > 0) {
+    const countLabel = abandoned.length > recentAbandoned.length ? ` (${recentAbandoned.length} of ${abandoned.length})` : '';
+    html += ui.label(`Abandoned${countLabel}`, true);
+    html += recentAbandoned.map(s => renderSessionTree(s, childrenMap, 0)).join('');
+  }
+
+  if (recentCompleted.length > 0) {
+    const countLabel = completed.length > recentCompleted.length ? ` (${recentCompleted.length} of ${completed.length})` : '';
+    html += ui.label(`Recent completed${countLabel}`, true);
+    html += recentCompleted.map(s => renderSessionTree(s, childrenMap, 0)).join('');
+  }
+
+  put('sessions-list', html);
+}
+
+function renderWorkflows(workflows) {
+  const names = Object.keys(workflows);
+  if (names.length === 0) {
+    put('workflows-list', ui.empty('No workflows loaded'));
+    return;
+  }
+
+  put('workflows-list', names.map(name => {
+    const wf = workflows[name];
+    const stateCount = Object.keys(wf.states).length;
+    const desc = wf.description ? ` — ${escapeHtml(wf.description)}` : '';
+    return ui.item({
+      href: `/workflow/${encodeURIComponent(name)}`,
+      title: `<span class="workflow-name">${escapeHtml(name)}</span>`,
+      info: `${stateCount} states${desc}`,
+    });
+  }).join(''));
+}
+
+// Every view is a real path (src/dashboard-routes.ts): links are plain anchors, history drives the back button.
+function navigate(path) {
+  if (path !== location.pathname) history.pushState(null, '', path);
+  applyRoute();
+}
+
+function applyRoute() {
+  route = Routes.parseRoute(location.pathname) || { view: 'sessions' };
+  const canonical = Routes.routePath(route);
+  if (location.pathname !== canonical) history.replaceState(null, '', canonical);
+  const tab = Routes.routeTab(route);
+  selectedSessionId = route.view === 'session' ? route.id : null;
+  shownWorkflow = null;
+  document.getElementById('plan-view').style.display = tab === 'plan' ? '' : 'none';
+  document.getElementById('map-view').style.display = tab === 'map' ? '' : 'none';
+  document.getElementById('timeline-view').style.display = tab === 'timeline' ? '' : 'none';
+  document.getElementById('pool-view').style.display = tab === 'pool' ? '' : 'none';
+  document.getElementById('cost-view').style.display = tab === 'cost' ? '' : 'none';
+  document.getElementById('main-view').style.display = tab === 'plan' || tab === 'map' || tab === 'timeline' || tab === 'pool' || tab === 'cost' ? 'none' : '';
+  document.getElementById('sessions-panel').style.display = tab === 'sessions' ? '' : 'none';
+  document.getElementById('workflows-panel').style.display = tab === 'workflows' ? '' : 'none';
+  for (const t of ['sessions', 'workflows', 'plan', 'timeline', 'pool', 'cost', 'map'])
+    document.getElementById('tab-' + t).classList.toggle('tab-active', t === tab);
+  document.getElementById('detail-content').innerHTML =
+    ui.empty(`Select a ${tab === 'workflows' ? 'workflow' : 'session'}`);
+  const loaded = [refresh(), showMap(tab === 'map' ? route : null)];
+  if (tab === 'plan') loaded.push(refreshPlan());
+  if (tab === 'timeline') loaded.push(refreshTimeline());
+  if (tab === 'pool') loaded.push(refreshPool());
+  if (tab === 'cost') loaded.push(refreshCost());
+  return Promise.all(loaded);
+}
+
+// The Map tab: /map draws every workflow session as a live map, /map/<id> scrolls to and highlights one lane.
+async function showMap(mapRoute) {
+  if (!mapRoute) {
+    if (liveMap) liveMap.hide();
+    return;
+  }
+  if (!liveMap) {
+    const m = await import('/map.js');
+    liveMap = m.createMap({ root: document.getElementById('map-view'), fetchJSON });
+  }
+  await liveMap.show(mapRoute.lane);
+}
+
+document.addEventListener('click', e => {
+  if (!Routes || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = e.target.closest ? e.target.closest('a[href]') : null;
+  if (!a || (a.target && a.target !== '_self') || a.origin !== location.origin) return;
+  if (!Routes.parseRoute(a.pathname)) return;
+  e.preventDefault();
+  navigate(a.pathname);
+});
+
+function sessionLink(id) {
+  return `<a href="/session/${encodeURIComponent(id)}">${escapeHtml(id)}</a>`;
+}
+
+function renderDetail(session) {
+  const isActive = session.stack.length > 0;
+
+  let html = '';
+
+  // Parent/child links
+  if (session.parent_session_id)
+    html += `<div class="rel"><span class="muted">Parent:</span> ${sessionLink(session.parent_session_id)}</div>`;
+  const children = allSessions.filter(s => s.parent_session_id === session.session_id);
+  if (children.length > 0)
+    html += `<div class="rel"><span class="muted">Children:</span> ${children.map(c => sessionLink(c.session_id)).join(', ')}</div>`;
+
+  // Stack
+  html += ui.label('Stack');
+  if (!isActive) {
+    const state = sessionState(session);
+    html += ui.frame(`${ui.plaque(state.text, state.cls)} Workflow ${escapeHtml(session.outcome || 'completed')}`);
+  } else {
+    html += session.stack.map((frame, i) => {
+      const live = i === session.active_frame;
+      const visits = frame.state_visits[frame.current_state] || 0;
+      const visitStr = visits > 1 ? ` (visit ${visits})` : '';
+      const state = sessionState(session);
+      const running = state.cls;
+      const dot = ui.dot(live ? running + ' live' : (i < session.active_frame ? 'st-wait' : 'ahead'));
+      const waiting = i < session.active_frame ? ' ' + ui.plaque('waiting', 'st-wait') : '';
+      const marker = live ? ' ' + ui.plaque(state.text, running) : '';
+      return ui.frame(`${dot}[${i}] <span class="workflow-name">${escapeHtml(frame.workflow)}</span> @ <span class="state-name">${escapeHtml(frame.current_state)}</span>${visitStr}${waiting}${marker}`, live, live ? running : '');
+    }).join('');
+    const agents = agentChips(session);
+    if (agents) html += ui.label('Agents', true) + agents;
+  }
+
+  // Prompt
+  if (isActive) {
+    const frame = session.stack[session.active_frame];
+    const wf = allWorkflows[frame.workflow];
+    const state = wf?.states?.[frame.current_state];
+    const isActionState = state?.type === 'exec' || state?.type === 'fetch';
+    const isSkillGateState = state?.skills && state.skills.length > 0;
+    if (isSkillGateState) {
+      html += ui.label('Skill Gate', true);
+      html += ui.box(state.skills.join('\n'));
+    } else if (isActionState) {
+      const info = state.type === 'exec' ? `command: ${state.command || '?'}` : `url: ${state.url || '?'}`;
+      html += ui.label(`Action State (${escapeHtml(state.type)})`, true);
+      html += ui.box(info);
+    } else {
+      html += ui.label('Current Prompt', true);
+      html += ui.box(state?.prompt || '(sub_workflow state)');
+    }
+
+    // Transitions
+    const entries = Object.entries(state?.transitions || {});
+    if (entries.length > 0) {
+      html += ui.label('Available Transitions', true);
+      html += `<div class="transitions">${entries.map(([name, target]) => ui.transition(name, target)).join('')}</div>`;
+    }
+  }
+
+  // Background PIDs
+  if (session.background_pids && Object.keys(session.background_pids).length > 0) {
+    html += ui.label('Background Processes', true);
+    for (const [stateName, pid] of Object.entries(session.background_pids))
+      html += ui.kv(stateName, `PID ${pid}`);
+  }
+
+  // Context
+  const ctxEntries = Object.entries(session.context || {});
+  if (ctxEntries.length > 0) {
+    html += ui.label('Context', true);
+    html += `<div id="context-panel">${ctxEntries.map(([k, v]) => ui.kv(k, escapeHtml(JSON.stringify(v)))).join('')}</div>`;
+  }
+
+  // Skills
+  const loadedSkills = session.loaded_skills;
+  if (loadedSkills && Object.keys(loadedSkills).length > 0) {
+    const epoch = session.skill_epoch ?? 0;
+    html += ui.label(`Loaded Skills <small>(epoch ${epoch})</small>`, true);
+    for (const [skill, loadedEpoch] of Object.entries(loadedSkills)) {
+      const stale = loadedEpoch < epoch;
+      html += `<div class="kv">${ui.dot(stale ? 'stop' : '')}<span class="key">${escapeHtml(skill)}</span>${stale ? ' <span class="muted">(stale)</span>' : ''}</div>`;
+    }
+  }
+
+  // Graph
+  if (isActive) {
+    const frame = session.stack[session.active_frame];
+    html += ui.label('Workflow Graph', true);
+    html += `<div class="graph">${renderGraph(frame.workflow, frame.current_state, session.stack, sessionState(session).live)}</div>`;
+  }
+
+  // History
+  html += ui.label('History', true);
+  const history = (session.history || []).slice(-20);
+  html += history.map(h => {
+    const actorHtml = h.actor ? ` <span class="actor ${actorClass(h.actor)}">${escapeHtml(h.actor)}</span>` : '';
+    const detailHtml = h.detail ? ` <span class="detail">(${escapeHtml(h.detail)})</span>` : '';
+    if (h.event === 'action') return `<div class="entry">[${h.frame}] ${ui.square()}<span class="auto">[auto]</span> ${escapeHtml(h.from || '')} → ${escapeHtml(h.to || '')}${detailHtml}</div>`;
+    if (h.event === 'skill_gate') return `<div class="entry">[${h.frame}] <span class="skills">[skills]</span> ${escapeHtml(h.from || '')} → ${escapeHtml(h.to || '')}</div>`;
+    if (h.event) return `<div class="entry">[${h.frame}] ${escapeHtml(h.event)}${h.workflow ? ' (' + escapeHtml(h.workflow) + ')' : ''}${actorHtml}</div>`;
+    return `<div class="entry">[${h.frame}] ${escapeHtml(h.from || '')} → ${escapeHtml(h.to || '')} via "${escapeHtml(h.via || '')}"${actorHtml}</div>`;
+  }).join('');
+
+  put('detail-content', html);
+}
+
+function pointsToPath(points) {
+  if (points.length < 2) return '';
+  if (points.length === 2) {
+    return `M${points[0].x},${points[0].y}L${points[1].x},${points[1].y}`;
+  }
+  // Catmull-Rom to cubic bezier through dagre control points
+  let d = `M${points[0].x},${points[0].y}`;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[Math.max(0, i - 1)];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[Math.min(points.length - 1, i + 2)];
+    const t = 1 / 6;
+    const cp1x = p1.x + (p2.x - p0.x) * t;
+    const cp1y = p1.y + (p2.y - p0.y) * t;
+    const cp2x = p2.x - (p3.x - p1.x) * t;
+    const cp2y = p2.y - (p3.y - p1.y) * t;
+    d += `C${cp1x},${cp1y},${cp2x},${cp2y},${p2.x},${p2.y}`;
+  }
+  return d;
+}
+
+// A node's class: the same state colours as the lists (live = running, stacked = waiting on a child).
+function graphNodeKind(state, isCurrent, isInStack, liveKey) {
+  if (isCurrent) return 'live ' + liveKey;
+  if (isInStack) return 'stacked';
+  if (state.skills && state.skills.length > 0) return 'skill';
+  if (state.type === 'exec') return state.background ? 'bg' : 'script';
+  if (state.type === 'fetch') return 'fetch';
+  if (state.terminal) return 'terminal';
+  return '';
+}
+
+function renderGraph(workflowName, currentState, stack, liveKey = '') {
+  const wf = allWorkflows[workflowName];
+  if (!wf) return ui.empty('Workflow definition not available');
+
+  const states = Object.entries(wf.states);
+  const nodeW = 160;
+  const nodeH = 48;
+
+  // Auto-detect layout direction: wide fan-out → left-to-right
+  let maxFanOut = 0;
+  for (const [, state] of states)
+    if (state.transitions) maxFanOut = Math.max(maxFanOut, Object.keys(state.transitions).length);
+  const rankdir = maxFanOut > 4 ? 'LR' : 'TB';
+
+  // Build dagre graph
+  const g = new dagre.graphlib.Graph({ multigraph: true });
+  g.setGraph({ rankdir, nodesep: 60, ranksep: 80, marginx: 30, marginy: 30 });
+  g.setDefaultEdgeLabel(() => ({}));
+
+  for (const [name, state] of states) {
+    g.setNode(name, { width: nodeW, height: nodeH, state });
+  }
+
+  // Edges: transitions, on_complete, on_fail
+  for (const [name, state] of states) {
+    if (state.transitions) {
+      for (const [label, target] of Object.entries(state.transitions)) {
+        if (g.hasNode(target))
+          g.setEdge(name, target, { label, type: 'transition' }, `t:${name}:${label}`);
+      }
+    }
+    if (state.sub_workflow) {
+      if (state.on_complete && g.hasNode(state.on_complete))
+        g.setEdge(name, state.on_complete, { label: 'on_complete', type: 'on_complete' }, `oc:${name}`);
+      if (state.on_fail && g.hasNode(state.on_fail))
+        g.setEdge(name, state.on_fail, { label: 'on_fail', type: 'on_fail' }, `of:${name}`);
+    }
+    // Action state routing edges
+    if (state.type === 'exec' || state.type === 'fetch') {
+      if (state.cases) {
+        for (const [code, target] of Object.entries(state.cases)) {
+          if (g.hasNode(target))
+            g.setEdge(name, target, { label: code, type: 'on_complete' }, `case:${name}:${code}`);
+        }
+        if (state.default && g.hasNode(state.default))
+          g.setEdge(name, state.default, { label: 'default', type: 'on_fail' }, `def:${name}`);
+      } else {
+        if (state.on_success && g.hasNode(state.on_success))
+          g.setEdge(name, state.on_success, { label: 'success', type: 'on_complete' }, `os:${name}`);
+        if (state.on_error && g.hasNode(state.on_error))
+          g.setEdge(name, state.on_error, { label: 'error', type: 'on_fail' }, `oe:${name}`);
+      }
+    }
+  }
+
+  dagre.layout(g);
+
+  if (g.nodes().length === 0) return ui.empty('No states');
+
+  // Compute actual bounding box including edge control points
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const name of g.nodes()) {
+    const node = g.node(name);
+    minX = Math.min(minX, node.x - nodeW / 2);
+    minY = Math.min(minY, node.y - nodeH / 2);
+    maxX = Math.max(maxX, node.x + nodeW / 2);
+    maxY = Math.max(maxY, node.y + nodeH / 2);
+  }
+  for (const e of g.edges()) {
+    const edgeData = g.edge(e);
+    for (const p of (edgeData.points || [])) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+  }
+  const pad = 40;
+  minX = Math.floor(minX - pad); minY = Math.floor(minY - pad);
+  maxX = Math.ceil(maxX + pad); maxY = Math.ceil(maxY + pad);
+  const svgW = maxX - minX;
+  const svgH = maxY - minY;
+
+  // Collect active states from stack for highlighting
+  const activeStates = new Set();
+  for (const frame of stack) {
+    if (frame.workflow === workflowName) activeStates.add(frame.current_state);
+  }
+
+  // Unique ID suffix to avoid marker collisions when multiple graphs on page
+  const uid = workflowName.replace(/[^a-zA-Z0-9]/g, '');
+  const EDGE_KIND = { on_complete: 'complete', on_fail: 'fail' };
+
+  let svg = `<svg viewBox="${minX} ${minY} ${svgW} ${svgH}" width="${svgW}" style="max-width:${svgW}px" xmlns="http://www.w3.org/2000/svg">`;
+
+  // Defs: one arrow head per edge kind, coloured by class
+  svg += '<defs>';
+  for (const kind of ['', 'complete', 'fail'])
+    svg += `<marker id="arr-${uid}-${kind || 'plain'}" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="10" markerHeight="6" orient="auto"><path class="g-arrow ${kind}" d="M0,0 L10,3 L0,6z"/></marker>`;
+  svg += '</defs>';
+
+  // Draw edges
+  for (const e of g.edges()) {
+    const edgeData = g.edge(e);
+    const points = edgeData.points || [];
+    if (points.length === 0) continue;
+
+    const isSelfLoop = e.v === e.w;
+    const kind = EDGE_KIND[edgeData.type] || '';
+    const from = g.node(e.v);
+    const to = g.node(e.w);
+    const isBack = !isSelfLoop && (rankdir === 'LR' ? to.x < from.x : to.y < from.y);
+    const cls = `g-edge ${kind}${isBack ? ' back' : ''}`;
+    const marker = `url(#arr-${uid}-${kind || 'plain'})`;
+
+    if (isSelfLoop) {
+      // Self-loop: arc above the node
+      const cx = from.x;
+      const cy = from.y - nodeH / 2;
+      const r = 22;
+      svg += `<path class="${cls}" d="M${cx - 12},${cy} A${r},${r} 0 1,1 ${cx + 12},${cy}" marker-end="${marker}"/>`;
+    } else {
+      svg += `<path class="${cls}" d="${pointsToPath(points)}" marker-end="${marker}"/>`;
+    }
+
+    // Edge label
+    if (edgeData.label && edgeData.x != null && !isSelfLoop) {
+      svg += `<text class="g-elabel ${kind}" x="${edgeData.x}" y="${edgeData.y - 5}" text-anchor="middle">${escapeHtml(edgeData.label)}</text>`;
+    }
+  }
+
+  // Draw nodes
+  for (const name of g.nodes()) {
+    const node = g.node(name);
+    const state = node.state || wf.states[name];
+    const x = node.x;
+    const y = node.y;
+    const w = nodeW;
+    const h = nodeH;
+    const isInitial = name === wf.initial;
+    const isTerminal = !!state.terminal;
+    const hasSubWorkflow = !!state.sub_workflow;
+    const isCurrent = name === currentState;
+    const isInStack = !isCurrent && activeStates.has(name);
+
+    const isExec = state.type === 'exec';
+    const isFetch = state.type === 'fetch';
+    const isAction = isExec || isFetch;
+    const isSkillGate = state.skills && state.skills.length > 0;
+    const kind = graphNodeKind(state, isCurrent, isInStack, liveKey);
+
+    // State nodes are plaques, exec states squares
+    const rx = isExec ? 4 : (isTerminal ? 24 : 18);
+
+    // Initial state: outer halo
+    if (isInitial && !isCurrent && !isInStack) {
+      svg += `<rect class="g-halo" x="${x - w / 2 - 4}" y="${y - h / 2 - 4}" width="${w + 8}" height="${h + 8}" rx="${rx + 2}"/>`;
+    }
+
+    // Wrap node elements in <g> so <title> tooltip works correctly
+    svg += `<g>`;
+
+    // Tooltip for action states
+    if (isAction) {
+      const tip = isExec ? (state.command || '') : (state.url || '');
+      svg += `<title>${escapeHtml(tip)}</title>`;
+    }
+
+    svg += `<rect id="gnode-${escapeHtml(name)}" class="g-node ${kind}" x="${x - w / 2}" y="${y - h / 2}" width="${w}" height="${h}" rx="${rx}" onclick="selectGraphNode('${escapeHtml(name)}')"/>`;
+
+    // Sub-workflow: inner nested rect
+    if (hasSubWorkflow) {
+      svg += `<rect class="g-inner" x="${x - w / 2 + 5}" y="${y - h / 2 + 5}" width="${w - 10}" height="${h - 10}" rx="${Math.max(2, rx - 5)}"/>`;
+    }
+
+    // Node label
+    svg += `<text class="g-name ${name.length > 16 ? 'small' : ''} ${kind}" x="${x}" y="${y + 1}" text-anchor="middle" dominant-baseline="middle">${escapeHtml(name)}</text>`;
+
+    // Sub-workflow name, action type or skill-gate tag below the label
+    if (hasSubWorkflow) {
+      svg += `<text class="g-tag sub" x="${x}" y="${y + 14}" text-anchor="middle" dominant-baseline="middle">${escapeHtml(state.sub_workflow)}</text>`;
+    }
+    if (isAction && !isCurrent && !isInStack) {
+      const label = isExec ? (state.background ? 'exec (bg)' : 'exec') : 'fetch';
+      svg += `<text class="g-tag ${kind}" x="${x}" y="${y + 14}" text-anchor="middle" dominant-baseline="middle">${label}</text>`;
+    }
+    if (isSkillGate && !isCurrent && !isInStack) {
+      svg += `<text class="g-tag skill" x="${x}" y="${y + 14}" text-anchor="middle" dominant-baseline="middle">skills</text>`;
+    }
+
+    svg += `</g>`;
+  }
+
+  svg += '</svg>';
+  return svg;
+}
+
+let selectedWorkflowState = null;
+
+function showWorkflowGraph(name) {
+  selectedSessionId = null;
+  shownWorkflow = name;
+  selectedWorkflowState = null;
+  const container = document.getElementById('detail-content');
+  container.innerHTML = ui.label('Workflow: ' + escapeHtml(name)) + `<div class="graph">${renderGraph(name, null, [])}</div>`;
+
+  const wf = allWorkflows[name];
+  if (wf) {
+    let stateList = ui.label('States', true);
+    stateList += '<div id="workflow-states-list">';
+    for (const [sn, state] of Object.entries(wf.states)) {
+      const flags = [];
+      if (sn === wf.initial) flags.push('initial');
+      if (state.terminal) flags.push('terminal');
+      if (state.sub_workflow) flags.push('sub: ' + state.sub_workflow);
+      if (state.type === 'exec') flags.push(state.background ? 'exec (bg)' : 'exec');
+      if (state.type === 'fetch') flags.push('fetch');
+      if (state.skills && state.skills.length > 0) flags.push('skills: ' + state.skills.join(', '));
+      const flagStr = flags.length > 0 ? ` <span class="muted">[${escapeHtml(flags.join(', '))}]</span>` : '';
+      const mark = state.type === 'exec' ? ui.square() : '';
+      stateList += `<div class="frame state-item" data-state="${escapeHtml(sn)}" data-workflow="${escapeHtml(name)}" onclick="toggleStatePrompt(this, '${escapeHtml(name)}', '${escapeHtml(sn)}')">${mark}<span class="state-name">${escapeHtml(sn)}</span>${flagStr}</div>`;
+    }
+    stateList += '</div>';
+    container.innerHTML += stateList;
+  }
+}
+
+function highlightGraphNode(stateName) {
+  document.querySelectorAll('svg .g-node.sel').forEach(rect => rect.classList.remove('sel'));
+  if (!stateName) return;
+  const rect = document.getElementById('gnode-' + stateName);
+  if (rect) rect.classList.add('sel');
+}
+
+function selectGraphNode(stateName) {
+  const list = document.getElementById('workflow-states-list');
+  if (!list) return;
+  const item = list.querySelector(`.state-item[data-state="${stateName}"]`);
+  if (!item) return;
+
+  // If it's a sub_workflow state, open that workflow instead
+  const wfName = item.dataset.workflow;
+  const wf = allWorkflows[wfName];
+  if (wf) {
+    const state = wf.states[stateName];
+    if (state && state.sub_workflow && allWorkflows[state.sub_workflow]) {
+      navigate(Routes.routePath({ view: 'workflow', name: state.sub_workflow }));
+      return;
+    }
+  }
+
+  toggleStatePrompt(item, wfName, stateName);
+  item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function toggleStatePrompt(el, workflowName, stateName) {
+  const wf = allWorkflows[workflowName];
+  if (!wf) return;
+  const state = wf.states[stateName];
+  if (!state) return;
+
+  // Deselect if clicking same state
+  if (selectedWorkflowState === stateName) {
+    selectedWorkflowState = null;
+    el.classList.remove('selected');
+    highlightGraphNode(null);
+    const existing = el.nextElementSibling;
+    if (existing && existing.classList.contains('state-prompt-wrapper'))
+      existing.remove();
+    return;
+  }
+
+  // Clear previous selection
+  const list = document.getElementById('workflow-states-list');
+  if (list) {
+    list.querySelectorAll('.state-item.selected').forEach(item => item.classList.remove('selected'));
+    list.querySelectorAll('.state-prompt-wrapper').forEach(item => item.remove());
+  }
+
+  selectedWorkflowState = stateName;
+  el.classList.add('selected');
+  highlightGraphNode(stateName);
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'state-prompt-wrapper';
+
+  let html = '';
+  if (state.skills && state.skills.length > 0) {
+    html += ui.box(state.skills.join('\n'), 'Required Skills');
+  } else if (state.type === 'exec' || state.type === 'fetch') {
+    const label = state.type === 'exec' ? 'Command' : 'URL';
+    const value = state.type === 'exec' ? (state.command || '?') : (state.url || '?');
+    html += ui.box(value, label);
+    if (state.success_prompt) html += ui.box(state.success_prompt, 'Success Prompt');
+    if (state.error_prompt) html += ui.box(state.error_prompt, 'Error Prompt');
+  } else {
+    html += ui.box(state.prompt || '(no prompt)', 'Prompt');
+  }
+
+  // Show transitions if any
+  const transitions = state.transitions ? Object.entries(state.transitions) : [];
+  if (transitions.length > 0)
+    html += `<div class="transitions">${transitions.map(([tName, target]) => ui.transition(tName, target)).join('')}</div>`;
+
+  wrapper.innerHTML = html;
+  el.after(wrapper);
+}
+
+// Plan tab: queue lines grouped by what they are now; reasons come from the picker via /api/queue.
+function timeIn(iso) {
+  const sec = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000));
+  return sec < 60 ? sec + 's' : sec < 3600 ? Math.floor(sec / 60) + 'm' : Math.floor(sec / 3600) + 'h';
+}
+
+function planSession(id) {
+  return allSessions.find(s => s.stack.length > 0 && typeof s.context.task === 'string'
+    && (s.context.task === id || s.context.task.startsWith(id + ' ') || s.context.task.startsWith(id + ':')));
+}
+
+// One queue line: a state dot, its plaque in the difficulty colour, the model chip, the flags, the first words of its text.
+function planRow(l, extra, stateCls) {
+  const flags = [l.exclusive ? 'exclusive' : '', l.paused ? 'parked' : ''].filter(Boolean).join(' ');
+  const text = l.text.length > 160 ? l.text.slice(0, 160) + '…' : l.text;
+  // A running line whose session sits on an `ask: parent` step reads as waiting: yellow, no glow.
+  const sess = l.status === 'running' ? planSession(l.id) : null;
+  const asking = sess && sessionState(sess).cls === 'st-wait';
+  const title = [
+    ui.difficulty(l.difficulty) + ui.kind(l),
+    ui.dot(asking ? 'st-wait' : stateCls + (l.status === 'running' ? ' ' + modelClass(l.model) + ' live' : '')),
+    ui.plaque(escapeHtml(l.id)),
+    l.priority ? `<span class="flags mono">${escapeHtml(l.priority)}</span>` : '',
+    l.model ? ui.chip(l.model) : '',
+    flags ? `<span class="flags">${escapeHtml(flags)}</span>` : '',
+  ].join(' ');
+  return ui.item({ title, info: extra || '', extra: escapeHtml(text), pick: l.id, active: l.id === planSelected });
+}
+
+// The side card of the selected queue line: its full text and the lines it waits for / that wait for it.
+let planSelected = null;
+let planLines = [];
+
+function planGraphSvg(lines, id) {
+  const q = Layout.queueGraph(lines, id);
+  if (q.nodes.length === 0) return '';
+  const w = 150, h = 32;
+  const g = new dagre.graphlib.Graph();
+  g.setGraph({ rankdir: 'LR', nodesep: 14, ranksep: 36, marginx: 10, marginy: 10 });
+  g.setDefaultEdgeLabel(() => ({}));
+  for (const n of q.nodes) g.setNode(n.id, { width: w, height: h });
+  for (const e of q.edges) g.setEdge(e.from, e.to);
+  dagre.layout(g);
+  const size = g.graph();
+  let svg = `<svg viewBox="0 0 ${size.width} ${size.height}" width="${size.width}" xmlns="http://www.w3.org/2000/svg">`
+    + '<defs><marker id="qarr" viewBox="0 0 10 6" refX="10" refY="3" markerWidth="10" markerHeight="6" orient="auto"><path class="g-arrow" d="M0,0 L10,3 L0,6z"/></marker></defs>';
+  for (const e of g.edges()) svg += `<path class="g-edge" d="${pointsToPath(g.edge(e).points)}" marker-end="url(#qarr)"/>`;
+  for (const n of q.nodes) {
+    const p = g.node(n.id);
+    svg += `<g class="qnode ${n.kind}${n.self ? ' sel' : ''}" data-plan-id="${escapeHtml(n.id)}"><title>${escapeHtml(n.id + ' — ' + n.kind)}</title>`
+      + `<rect class="g-node" x="${p.x - w / 2}" y="${p.y - h / 2}" width="${w}" height="${h}" rx="8"/>`
+      + `<text class="qlabel" x="${p.x}" y="${p.y + 4}" text-anchor="middle">${escapeHtml(n.id.length > 22 ? n.id.slice(0, 21) + '…' : n.id)}</text></g>`;
+  }
+  return svg + '</svg>';
+}
+
+function renderPlanCard() {
+  const l = planLines.find(x => x.id === planSelected);
+  const el = document.getElementById('plan-card');
+  document.getElementById('plan-cols').classList.toggle('open', !!l);
+  if (!l) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const kind = Layout.queueNodeKind(l);
+  put('plan-card', ui.label(ui.difficulty(l.difficulty) + ui.kind(l) + ' ' + ui.plaque(escapeHtml(l.id)) + ` <span class="flags">${kind}</span>`
+    + ' <a class="close" href="#" data-plan-id="">close</a>')
+    + (l.after ? ui.kv('after', escapeHtml(l.after)) : '')
+    + `<div class="plan-text">${escapeHtml(l.text)}</div>`
+    + `<div class="graph">${planGraphSvg(planLines, l.id)}</div>`);
+}
+
+document.addEventListener('click', ev => {
+  const t = ev.target.closest && ev.target.closest('[data-plan-id]');
+  if (!t) return;
+  const link = ev.target.closest('a[href]:not(.close)');
+  if (link) return;
+  ev.preventDefault();
+  const id = t.dataset.planId;
+  planSelected = id === '' || (id === planSelected && t.classList.contains('pick')) ? null : id;
+  put('plan-content', planQueues.map(renderPlan).join(''));
+  renderPlanCard();
+});
+
+// `next: … +N` / `landed earlier: … +N` over a group of lines (the first few, then the count).
+function planStrip(lead, lines, cls) {
+  const shown = lines.slice(0, 6);
+  return ui.strip(lead, shown.map(l => ui.difficulty(l.difficulty) + ui.kind(l) + ui.plaque(escapeHtml(l.id))),
+    lines.length - shown.length, cls);
+}
+
+// A waiting line's reason; "overlaps X" names a ready line when X is only admitted ahead in the same pass, not running.
+function planWait(l, lines) {
+  const m = /^overlaps (\S+)/.exec(l.reason);
+  const other = m && lines.find(x => x.id === m[1]);
+  const note = other && other.status === 'pending' ? ' (ready, admitted ahead in the same pass)' : '';
+  return escapeHtml(l.reason) + note;
+}
+
+function renderPlan(q) {
+  const by = f => q.lines.filter(f);
+  let h = `<div class="id mono">${escapeHtml(q.file)} — batch_size ${q.batchSize}</div>`;
+  // A done task is "today" when its last note (the land's) is dated today.
+  const d = new Date();
+  const today = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const ready = by(l => l.status === 'pending' && l.reason === 'ready').sort((a, b) => (a.pickOrder ?? 0) - (b.pickOrder ?? 0));
+  const done = by(l => l.status === 'done' && l.lastNoteDate === today);
+  h += planStrip('next:', ready, 'next') + planStrip('landed earlier:', done, 'landed');
+  const group = (title, lines, extra, stateCls) => {
+    h += ui.label(`${title} (${lines.length})`, true);
+    for (const l of lines) h += planRow(l, extra(l), stateCls);
+  };
+  group('Running', by(l => l.status === 'running'), l => {
+    const s = planSession(l.id);
+    if (!s) return 'no session';
+    const f = s.stack[s.active_frame];
+    const entered = s.history.filter(e => e.frame === s.active_frame && e.to === f.current_state);
+    const at = entered.length ? entered[entered.length - 1].at : s.started_at;
+    return `<a href="/session/${encodeURIComponent(s.session_id)}">${escapeHtml(f.workflow + ' @ ' + f.current_state)}</a> · ${timeIn(at)}`;
+  }, 'st-run');
+  group('Ready', ready, () => '', '');
+  group('Waiting', by(l => l.status === 'pending' && l.reason !== 'ready'), l => planWait(l, q.lines), 'st-wait');
+  group('Failed', by(l => l.status === 'failed'), () => '', 'st-stop');
+  group('Done today', done, () => '', 'st-done');
+  return h;
+}
+
+async function refreshPlan() {
+  const files = await fetchJSON('/api/queues');
+  if (!files || files.length === 0) return;
+  const qs = await Promise.all(files.map(f => fetchJSON('/api/queue?file=' + encodeURIComponent(f))));
+  const ok = qs.filter(Boolean);
+  if (ok.length === 0) return;
+  planQueues = ok;
+  planLines = ok.flatMap(q => q.lines);
+  put('plan-content', ok.map(renderPlan).join(''));
+  renderPlanCard();
+}
+let planQueues = [];
+
+// Timeline tab: a bar per task pipeline of the day (GET /api/timeline), segments coloured by stage group,
+// pool-lease waits hatched; the window is the day's activity, padded to whole hours.
+const TL_GROUPS = ['recon', 'plan', 'work', 'gate', 'review', 'land', 'wait'];
+
+function tlClock(ms) {
+  const d = new Date(ms);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2, '0')).join(':');
+}
+
+function tlSpan(ms) {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0') + 's' : Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm';
+}
+
+function tlDayShift(day, delta) {
+  const [y, m, d] = day.split('-').map(Number);
+  const x = new Date(y, m - 1, d + delta);
+  return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
+}
+
+function renderTimeline(t) {
+  const days = `<div class="tl-days"><a href="/timeline/${tlDayShift(t.day, -1)}">&larr; ${tlDayShift(t.day, -1)}</a><span class="mono">${escapeHtml(t.day)}</span><a href="/timeline/${tlDayShift(t.day, 1)}">${tlDayShift(t.day, 1)} &rarr;</a><a href="/timeline">today</a></div>`;
+  const legend = `<div class="tl-legend">${TL_GROUPS.map(g => `<span><span class="tl-seg ${g}"></span>${g}</span>`).join('')}<span><span class="tl-seg wait"><span class="tl-wait" style="left:0;right:0"></span></span>pool wait</span></div>`;
+  if (t.bars.length === 0) return days + legend + ui.empty('No pipelines on this day');
+  const H = 3600000;
+  // whole LOCAL hours (a zone with a half-hour offset must not shift the axis)
+  const hourOf = (ms, up) => { const d = new Date(ms); d.setMinutes(0, 0, 0); return d.getTime() + (up && d.getTime() < ms ? H : 0); };
+  const lo = Math.max(t.from, hourOf(Math.min(...t.bars.map(b => b.start)), false));
+  const hi = Math.min(t.to, Math.max(lo + 2 * H, hourOf(Math.max(...t.bars.map(b => b.end)), true)));
+  const pct = ms => ((ms - lo) / (hi - lo) * 100).toFixed(3);
+  const ticks = [];
+  const step = (hi - lo) / H > 12 ? 2 * H : H;
+  for (let x = lo; x <= hi; x += step) ticks.push(`<span style="left:${pct(x)}%">${tlClock(x).slice(0, 5)}</span>`);
+  const seg = (r, g) => {
+    const waits = g.waits.map(w => `<span class="tl-wait" style="left:${((w.start - g.start) / (g.end - g.start) * 100).toFixed(3)}%;width:${((w.end - w.start) / (g.end - g.start) * 100).toFixed(3)}%"></span>`).join('');
+    const wait = g.waits.reduce((n, w) => n + w.end - w.start, 0);
+    const tip = `${g.state} (${g.group}) · ${tlClock(g.start)} · ${tlSpan(g.end - g.start)}` + (wait ? ` · pool wait ${tlSpan(wait)}` : '');
+    return `<span class="tl-seg ${g.group}" style="left:${pct(g.start)}%;width:${((g.end - g.start) / (hi - lo) * 100).toFixed(3)}%" title="${escapeHtml(tip)}" data-state="${escapeHtml(g.state)}">${waits}</span>`;
+  };
+  const rows = t.bars.map(b => b.rows.map((r, i) => {
+    const name = i === 0
+      ? `<a href="/session/${encodeURIComponent(r.session)}">${escapeHtml(b.task || r.session)}</a>`
+      : escapeHtml(r.workflow || r.session);
+    const title = i === 0 ? `${b.outcome} · ${tlClock(b.start)} · ${tlSpan(b.end - b.start)}${b.detailed ? '' : ' · from the ledger'}` : r.session;
+    return `<div class="tl-row${i ? ' sub' : ''}"><div class="tl-name" title="${escapeHtml(title)}">${name}</div><div class="tl-track">${r.segments.map(g => seg(r, g)).join('')}</div></div>`;
+  }).join('')).join('');
+  return days + legend + `<div class="tl-scroll"><div class="tl"><div class="tl-axis">${ticks.join('')}</div>${rows}</div></div>`;
+}
+
+async function refreshTimeline() {
+  const t = await fetchJSON('/api/timeline' + (route.day ? '?day=' + route.day : ''));
+  if (t) put('timeline-content', renderTimeline(t));
+}
+
+// Pool tab: the machine-wide thread pool (GET /api/pool, the data `pool_status` prints): budget and load, each lease,
+// each waiter in admission order; refreshed with the page's 2 s tick.
+function renderPool(p) {
+  const head = `<div class="pool-head"><span>budget <b>${p.budget}</b></span><span>held <b>${p.held}</b></span><span>load <b>${p.load.toFixed(2)}</b></span><span>external <b>${p.external.toFixed(1)}</b></span><span>threshold <b>${p.load_threshold}</b></span><span>locks <b>${p.locks.length ? escapeHtml(p.locks.join(', ')) : 'none'}</b></span></div>`
+    + (p.starvedNote ? `<div class="pool-note">${ui.plaque('STARVED', 'st-stop')} ${escapeHtml(p.starvedNote)}</div>` : '');
+  const flags = r => (r.overrun ? ui.plaque('OVERRUN ~' + Math.round(r.runs), 'st-stop') : '') + (r.starved ? ui.plaque('STARVED', 'st-stop') : '');
+  const row = (r, pos) => {
+    const e = r.entry;
+    const session = e.session_id ? `<a href="${Routes.routePath({ view: 'session', id: e.session_id })}">${escapeHtml(e.session_id.slice(0, 8))}</a>` : '';
+    const project = e.project || e.cwd || '';
+    return `<tr><td class="mono">${pos === undefined ? '' : pos}</td><td class="mono">${e.pid}</td><td>${escapeHtml(r.request)}</td><td>${e.priority}${e.level ? ' ' + escapeHtml(e.level) : ''}</td>`
+      + `<td>${tlSpan(r.ageMs)}</td><td title="${escapeHtml(project)}">${escapeHtml(project.split('/').pop())}</td><td class="mono">${session}</td><td class="mono">${escapeHtml(e.step || '')}</td><td>${escapeHtml(e.label || '')}</td><td>${flags(r)}</td></tr>`;
+  };
+  const table = (title, label, rows, numbered) => rows.length === 0 ? ui.label(`${title} (0)`, true) + ui.empty('none', true)
+    : ui.label(`${title} (${rows.length})`, true) + `<div class="pool-scroll"><table class="pool-table"><thead><tr><th>${numbered ? '#' : ''}</th><th>pid</th><th>${label}</th><th>prio</th><th>${numbered ? 'waiting' : 'since'}</th><th>project</th><th>session</th><th>step</th><th>label</th><th></th></tr></thead><tbody>${rows.map((r, i) => row(r, numbered ? i + 1 : undefined)).join('')}</tbody></table></div>`;
+  return head + table('Leases', 'holds', p.leases, false) + table('Waiting, in admission order', 'wants', p.waiting, true);
+}
+
+async function refreshPool() {
+  const p = await fetchJSON('/api/pool');
+  if (p) put('pool-content', renderPool(p));
+}
+
+// Cost tab: tokens and USD per finished task pipeline (GET /api/cost?from=&to=), the range's totals and a 14-day $/landed trend.
+// The range inputs keep their value across the 2 s tick; the price table is the calibration module's (noted in the tab).
+const usd = n => '$' + n.toFixed(2);
+function renderCost(c) {
+  const t = c.totals;
+  const range = `<div class="cost-range"><label>from <input type="date" id="cost-from" value="${escapeHtml(c.from)}"></label><label>to <input type="date" id="cost-to" value="${escapeHtml(c.to)}"></label></div>`;
+  const head = `<div class="pool-head"><span>tasks <b>${t.tasks}</b></span><span>landed <b>${t.landed}</b> (${t.measured_landed} with tokens)</span><span>tokens <b>${Math.round(t.tokens)}</b></span><span>spent <b>${usd(t.usd)}</b></span><span>per landed <b>${t.usd_per_landed === null ? 'n/a' : usd(t.usd_per_landed)}</b></span></div>`;
+  const max = Math.max(0, ...c.trend.map(d => d.usd_per_landed || 0));
+  const trend = ui.label('$ per landed, last 14 days', true) + `<div class="cost-trend">${c.trend.map(d => `<div class="cost-bar" title="${escapeHtml(d.day)} · ${d.usd_per_landed === null ? 'nothing landed' : usd(d.usd_per_landed)} · ${d.landed} landed · ${usd(d.usd)}"><i style="height:${max ? Math.round((d.usd_per_landed || 0) / max * 100) : 0}%"></i></div>`).join('')}</div>`;
+  const stages = k => k.stages.map(s => `${escapeHtml(s.stage)} ${escapeHtml(s.model)} ${Math.round(s.tokens)}${s.usd === undefined ? ' (no price)' : ' ' + usd(s.usd)}`).join('<br>');
+  const rows = c.tasks.map(k => `<tr><td>${escapeHtml(k.task)}</td><td>${ui.plaque(k.outcome, k.outcome === 'landed' ? 'st-done' : k.outcome === 'failed' ? 'st-stop' : 'st-wait')}</td><td class="mono">${k.rounds}</td><td class="mono">${k.measured ? Math.round(k.tokens) : 'n/a'}</td><td class="mono">${k.measured ? usd(k.usd) : 'n/a'}</td><td class="cost-stages">${stages(k)}</td></tr>`).join('');
+  const table = c.tasks.length === 0 ? ui.empty('no finished task in the range', true)
+    : `<div class="pool-scroll"><table class="pool-table"><thead><tr><th>task</th><th>outcome</th><th>rounds</th><th>tokens</th><th>usd</th><th>by stage and model</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  const prices = Object.entries(c.prices.usd_per_mtok).map(([m, p]) => `${escapeHtml(m)} $${p}`).join(', ');
+  const note = `<div class="pool-note">Per landed counts landed tasks that recorded tokens; <i>n/a</i> = no tokens recorded, <i>unknown</i> = no visits recorded. Prices (blended USD per million tokens): ${prices}; updated ${escapeHtml(c.prices.updated)}; source: ${escapeHtml(c.prices.source)}.</div>`;
+  return range + head + trend + table + note;
+}
+
+async function refreshCost() {
+  const f = document.getElementById('cost-from'), t = document.getElementById('cost-to');
+  const q = f && t && f.value && t.value ? `?from=${f.value}&to=${t.value}` : '';
+  const c = await fetchJSON('/api/cost' + q);
+  if (c) put('cost-content', renderCost(c));
+}
+
+// The page opens on the view its path names (the status-line pane links to /session/<id>).
+Promise.all([import('/routes.js'), import('/stable.js'), import('/map-layout.js')]).then(([m, s, l]) => {
+  Routes = m;
+  Layout = l;
+  Stable = s;
+  Stable.rememberScroll();
+  window.addEventListener('popstate', applyRoute);
+  // the content is built after load, so the browser has nothing to restore: put the page back where F5 left it
+  // (the map restores itself once its first scene stands)
+  applyRoute().then(() => {
+    const at = route.view === 'map' ? null : Stable.takeScroll();
+    if (at) Stable.restoreScroll(at);
+  });
+  setInterval(() => { refresh(); if (route.view === 'plan') refreshPlan(); if (route.view === 'timeline') refreshTimeline(); if (route.view === 'pool') refreshPool(); if (route.view === 'cost') refreshCost(); }, 2000);
+});
+</script>
+</body>
+</html>

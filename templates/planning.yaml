@@ -1,0 +1,175 @@
+name: planning
+description: "Planning sub-workflow — explore, design plan, record workflow context"
+initial: load_skills
+max_transitions: 30
+
+states:
+  load_skills:
+    skills:
+      - coding-skill-selector
+      - ?project-skill-selector
+    transitions:
+      continue: explore_needed
+
+  explore_needed:
+    prompt: |
+      Determine if codebase exploration is needed before planning.
+
+      1. Check loaded skills, MEMORY.md, and project CLAUDE.md
+      2. Read the user's task description — do you already understand the scope?
+
+      Choose transition:
+      - `explore` → need to explore codebase first
+      - `skip` → scope is clear, go straight to planning
+    transitions:
+      explore: run_explore
+      skip: design
+
+  run_explore:
+    sub_workflow: explore
+    on_complete: design
+    on_fail: design
+
+  design:
+    # The Resume line in the plan-file template below — `transition("<session_id>", "planned")`
+    # — is load-bearing: hooks/workflow-start.sh regex-matches this exact positional
+    # form (transition\(\\"[a-f0-9]+\\") to recover the session ID on plan resume.
+    # Keep it EXACTLY as is; do not normalize to named arguments.
+    prompt: |
+      Design the implementation plan. (Coding skills incl. architecture
+      and the project's structural-navigation skill were loaded at the
+      `load_skills` gate — follow them; do not default to grep on
+      parseable source.)
+
+      **Plan mode**: if system prompt says "Plan mode is active" — you're already in it,
+      do NOT call EnterPlanMode. Otherwise call `EnterPlanMode`.
+
+      **Dynamic check**: If the task is operational/multi-step (not pure code changes —
+      e.g. git operations, deployment, file management, CI/CD setup) → transition `dynamic`
+      to create the execution workflow directly instead of writing a text plan.
+
+      **Data flow rule**: when the task involves reading or writing persistent data
+      (files, cache, database), the explore phase MUST trace the complete data flow:
+      write → serialize → load → copy → consumer. Don't stop at 'found where it's
+      stored' — follow the path until you see how the data reaches its consumers.
+      Check how analogous fields in the same system are handled.
+
+      **Before proposing a new storage mechanism** (Store, DB column, file scan):
+      verify — does the project already have infrastructure for this type of data?
+      Check how similar fields are stored and propagated. Use existing infrastructure first.
+
+      **UI animation plans**: for any animation/transition changes, include a
+      per-element table: Element | Start state | End state | Tween props | Notes.
+      Ambiguous phrases like "crossfade" or "morph" cause misinterpretation.
+      Be explicit: "icon tweens x from 0 to -offset, alpha 1→0, no y change."
+
+      **Plan scope**: focus on WHAT to change and WHY. Do NOT include build, run,
+      or launch steps in the plan — the execution workflow handles building and
+      running automatically in its review/testing states. Including them causes
+      the agent to run manual builds that conflict with the automated pipeline.
+
+      **Tasks and steps** (two levels, both in the plan). A TASK can be tested, reviewed
+      and landed on its own and leaves main green. A STEP cannot, or is too small to pay
+      for its own check, review and land: it shares its task's. Split into tasks only
+      along that line: work that compiles or passes only together is ONE task with
+      steps; a change that is useful without the rest is its own task. A small change
+      written in several places is one task with steps, not a queue.
+      - One task (any number of steps): write the steps; no table.
+      - Two or more tasks: add a `## Tasks` table and the steps under each task:
+        ```
+        ## Tasks
+        | id | after | touches | difficulty |
+        |----|-------|---------|------------|
+        | T1 | —     | src/a, docs/x.md | 4 |
+        | T2 | T1    | src/b            | 3 |
+
+        ### T1 — <title>
+        1. <step>
+        2. <step>
+        ```
+        `after` = tasks that must land first (an order the code needs, not a wish);
+        `touches` = paths (prefixes) the task edits — check each exists (or is a new
+        file under an existing directory) before naming it; if any path of a task
+        cannot be checked, the task gets no `touches` at all (it then runs alone, which is
+        slow but never wrong; a partial list claims less than the task edits);
+        `difficulty` per the rubric (1..10). Two tasks with no `after` between
+        them must not share a path.
+
+      **Brevity**: fewer steps. Skip what the user can infer from the task. Don't
+      restate the task back at the top of the plan. No filler sections (`Overview`,
+      `Background`) unless the task is genuinely novel and context is needed.
+
+      **Steps in plan mode:**
+      1. Explore codebase (directly or via Plan/Explore subagents — explicit
+         `model` + `effort`: `haiku`/low to locate, `opus`/high for design-critical analysis)
+      2. Design approach — the PLAN itself is built HERE, inline, never in a
+         plan sub-agent: it condenses the user dialog no brief can carry,
+         and the planner must be the dispatcher (recon delegates, the plan
+         does not)
+      3. Write plan to the plan file specified in plan mode system prompt
+      4. Plan file MUST end with Workflow section (get session_id via `status`):
+         ```
+         ## Workflow
+         - **Session**: `<session_id>`
+         - **Current state**: `planning @ design`
+         - **After approve**: transition `planned` → returns to parent
+         - **Execution workflow**: coding / docs / feature / bug_fix / testing / refactoring / <workflow-name>; `batch` when there are two or more tasks
+         - **Resume**: `transition("<session_id>", "planned")`
+         - **Tasks**: <N> (1 = one task, its steps run in the Execution workflow; 2 or more = the `## Tasks` table is queued and run by `batch`)
+         ```
+         Keep `Tasks` the LAST line, after Resume: the start hook reads the section by
+         position (Session within five lines of the heading).
+      5. Call `ExitPlanMode` for user approval
+
+      **After plan approved → transition `planned`.**
+      **If the user rejects the plan** → revise the plan file per their feedback,
+      then call `ExitPlanMode` again. Do NOT transition until approved.
+    transitions:
+      planned: done
+      dynamic: create_workflow
+
+  create_workflow:
+    # Resume line in the template below: same load-bearing positional form as in
+    # `design` (hook regex) — keep `transition("<session_id>", "planned")` exactly.
+    prompt: |
+      The task is operational/dynamic — create the execution workflow directly.
+      The workflow IS the plan.
+
+      **First**: call `Skill("workflow-authoring")` for exec/fetch state reference.
+
+      **Plan mode**: if system prompt says "Plan mode is active" — you're already in it,
+      do NOT call EnterPlanMode. Otherwise call `EnterPlanMode`.
+
+      0. If a suitable workflow already exists (check `list`), skip creation —
+         just set `context_set(session_id, "dynamic_workflow", "<existing-name>")`
+      1. Design the step-by-step workflow (skip if using existing)
+      2. Call `create("task-<name>", definition)` with focused states (skip if using existing)
+         - Each state should be small and actionable
+         - Always have `done` (terminal, outcome: complete) and `failed` (terminal, outcome: fail)
+         - Use `on_fail` for recovery paths
+      3. Save workflow name to context: `context_set(session_id, "dynamic_workflow", "task-<name>")`
+      4. Write plan file with:
+         - Brief context of what the workflow does
+         - Reference to the created workflow name
+         - The FULL Workflow section (get session_id via `status`):
+           ```
+           ## Workflow
+           - **Session**: `<session_id>`
+           - **Current state**: `planning @ create_workflow`
+           - **After approve**: transition `planned` → returns to parent
+           - **Execution workflow**: <workflow-name> (actual name, not "dynamic")
+           - **Resume**: `transition("<session_id>", "planned")`
+           - **Tasks**: 1
+           ```
+      5. Call `ExitPlanMode` for user approval
+
+      **After plan approved → transition `planned`.**
+      **If the user rejects the plan** → revise the plan file (and the workflow
+      definition if needed) per their feedback, then call `ExitPlanMode` again.
+      Do NOT transition until approved.
+    transitions:
+      planned: done
+
+  done:
+    prompt: "Plan approved. Returning to parent workflow for execution."
+    terminal: true

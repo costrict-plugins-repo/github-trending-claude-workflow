@@ -1,0 +1,8 @@
+node_modules
+build/
+.DS_Store
+.playwright-mcp/
+
+# Override global gitignore for Claude plugin files
+!CLAUDE.md
+!.mcp.json

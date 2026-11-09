@@ -1,0 +1,595 @@
+name: bug-fix
+description: "Standard bug fix workflow"
+initial: classify
+max_transitions: 50
+
+# `difficulty` (1..10; rubric: workflow-authoring skill) is optional: set at start or at the plan state
+# (`think` / `diagnose`), the engine writes `model_<stage>` / `effort_<stage>` and the agent prompts
+# spawn with them; without one those keys are empty and each prompt's prose rule applies.
+model_table:
+  stages:
+    execute:
+      - { upto: 6, model: sonnet, effort: high }
+      - { upto: 8, model: opus, effort: high }
+      - { upto: 10, model: opus, effort: xhigh }
+    review:
+      - { upto: 8, model: opus, effort: high }
+      - { upto: 10, model: opus, effort: xhigh }
+
+states:
+  classify:
+    task: "Classify bug type"
+    prompt: |
+      Classify the bug before proceeding.
+
+      Look at the user's report:
+      - Does it include a screenshot or describe a VISUAL problem (layout, overlap, wrong color, missing element)?
+      - Or is it a LOGIC problem (wrong data, crash, incorrect calculation, serialization error)?
+
+      Persist the classification for verify_route:
+      `context_set({ key: "bug_type", value: "visual" })` (or `"logic"`)
+
+      Choose:
+      - `visual` → UI/layout bug — requires debug bridge, screenshots, visual reproduction
+      - `logic` → data/logic bug — reproducible via unit tests or logs
+    transitions:
+      visual: load_skills_visual
+      logic: load_skills_logic
+
+  load_skills_logic:
+    skills:
+      - coding-skill-selector
+      - "?debugging"
+      - ?project-skill-selector
+    transitions:
+      continue: reproduce_logic
+
+  load_skills_visual:
+    skills:
+      - coding-skill-selector
+      - "?debugging"
+      - ?debug-bridge
+      - ?project-skill-selector
+    transitions:
+      continue: reproduce_visual
+
+  reproduce_visual:
+    task: "Reproduce the bug visually"
+    prompt: |
+      Reproduce the bug VISUALLY before proceeding — reading code is NOT reproduction.
+
+      DO NOT fix the bug here. You may add trace/log statements to help reproduce,
+      but do NOT modify production logic. The fix comes later, after diagnosis.
+
+      REPRODUCTION TOOLING — find the right tool:
+      1. Check available MCP tools for browser/screenshot/debug-bridge capabilities.
+      2. Pick the tool matching the platform.
+      3. Persist the choice for verify_visual:
+         `context_set({ key: "chosen_tool", value: "<short name + how to launch>" })`
+
+      "No tooling available" is almost never true for a visual app. Verify the MCP
+      tool list before choosing `cant_reproduce`. Do NOT `abort()` to escape this
+      gate — use `cant_reproduce` if genuinely blocked.
+
+      MANDATORY STEPS (all required, in order):
+      1. Understand the exact user path that triggers the bug (which button, which file, which action)
+      2. Build (if applicable — native targets must be built before launch)
+      3. Launch the app and connect with the tool chosen above
+      4. Follow the SAME path the user described to trigger the bug
+      5. Take a screenshot and VERIFY the bug is visible
+      6. Describe what you see — compare with the user's report
+
+      STOP — self-check before transitioning:
+      - Did you LAUNCH the app and take a SCREENSHOT? If not, you haven't reproduced.
+      - Can you SEE the bug in YOUR screenshot? If not → `cant_reproduce`.
+      - "I can see from the code that..." is NOT evidence. Run the app.
+      - User screenshots are NOT your reproduction. YOU must see it in YOUR screenshot.
+
+      `reproduced` = you have YOUR OWN screenshot showing the bug. No exceptions.
+      `cant_reproduce` = you tried but can't see it. This leads to asking the user for help.
+      NEVER use `reproduced` when you haven't seen the bug yourself.
+
+      If the bug requires simulated input or file operations, use the chosen
+      tool's input-simulation capabilities.
+    transitions:
+      reproduced: diagnose
+      cant_reproduce: clarify
+
+  reproduce_logic:
+    task: "Reproduce the bug with tests"
+    prompt: |
+      Reproduce the bug by EXECUTING code — reading source is NOT reproduction.
+
+      DO NOT fix the bug here, and do NOT touch production code at all — not even
+      trace/log statements. Write test code to reproduce. The fix comes later,
+      after diagnosis.
+
+      FILE RESTRICTION: You may ONLY create or edit test files.
+      Any edit to production code is a workflow violation.
+
+      MANDATORY STEPS (all required, in order):
+      1. Understand the exact scenario that triggers the bug
+      2. Write a minimal FAILING test that demonstrates the wrong behavior
+      3. BUILD and RUN the test — show the actual output
+      4. Describe: EXPECTED vs ACTUAL — what should happen vs what does happen
+
+      Delegate the build+run to a flat `general-purpose` subagent
+      (build/run/report — no workflow, no skills) to keep build output
+      out of main context.
+      A flat subagent inherits none of this project's skills or env
+      rules — it only knows what YOU put in its spawn prompt. So include
+      VERBATIM in that prompt: (a) any tooling/hook constraints that
+      apply in this project (required CLIs, blocked commands), and
+      (b) "Strip noise, but quote every error, failing assertion, and
+      number VERBATIM — don't paraphrase the signal or replace it with
+      a verdict; the parent judges.", and (c) "Bash: run commands
+      FOREGROUND with an explicit timeout sized to the command;
+      background ONLY for never-exiting processes (servers, watchers)
+      or runs over the 10-min foreground ceiling."
+      Spawn with `run_in_background: false` — you need the result before transitioning.
+
+      STOP — self-check before transitioning:
+      - Did you EXECUTE something (build + run)? Reading code ≠ reproduction.
+      - Can you paste the failing output? If not, you haven't reproduced yet.
+      - "I can see from the code that..." is NOT evidence. Run the code.
+      - Run `git diff --name-only` — if ANY file outside test directories was modified,
+        you violated the workflow. Revert before transitioning: revert only the hunks
+        you added, and verify the file was clean before your first edit.
+
+      DO NOT transition to `reproduced` without concrete executed evidence
+      (test failure output, wrong runtime output, crash log).
+
+      If the bug is hard to cover with a unit test (UI state, complex setup, timing),
+      transition `try_visual` to reproduce via debug bridge instead.
+      If you genuinely cannot reproduce at all → `cant_reproduce` (asks the user for help).
+    transitions:
+      reproduced: diagnose
+      try_visual: load_skills_visual
+      cant_reproduce: clarify
+
+  diagnose:
+    task: "Diagnose root cause"
+    prompt: |
+      DIFFICULTY (skip if context `difficulty` is set): from the plan `context_set(key: "difficulty",
+      value: N)`, N by the WORK: 2 one function; 3 one owner; 4 a few files at one owner; 5 a new
+      rule/command on existing parts; 6 a new shared component or config key; 7 cross-file typing or an
+      unknown cause; 8 a contract moving across packages; 9-10 a whole-tree redesign to be split;
+      +1 when the premise is a stale measurement or a hypothesis.
+
+      Find the root cause of the bug.
+
+      DO NOT fix the bug here. You may add trace/log statements to narrow down
+      the cause, but do NOT modify production logic. The fix comes later, after diagnosis.
+
+      FILE RESTRICTION: Do NOT add new methods, fields, or change signatures.
+      Only trace/log statements are allowed. Any structural code change is a workflow violation.
+
+      STOP — self-check before transitioning:
+      - Run `git diff --name-only` — if any production file was modified beyond trace
+        statements, revert before transitioning: revert only the hunks you added, and
+        verify the file was clean before your first edit.
+
+      Delegating root-cause analysis to a subagent (it reads code to judge —
+      ANALYTICAL)? Include in the agent prompt VERBATIM:
+      ---
+      IMPORTANT: Override the default CLAUDE.md rule about start().
+      Do NOT call start() without arguments.
+      Instead, your FIRST action must be:
+        mcp__plugin_workflow_wf__start({ workflow: "subagent", parent_session_id: "<SESSION_ID>" })
+      where <SESSION_ID> is the current session ID (substitute it before sending).
+      Then follow the subagent workflow until completion — its `route` state
+      self-classifies (analytical → skill-loaded sub-workflow; trivial → execute).
+      start() returns `SESSION: <id>` — pass that session_id explicitly in every subsequent workflow tool call (transition, context_set); parallel siblings share the same ppid.
+      ---
+      After collecting reports: `sessions` → `abort` orphaned child `subagent`
+      sessions. NEVER spawn an analytical subagent flat (no workflow = no skills).
+      Its report gates your diagnosis → spawn with `run_in_background: false`.
+
+      After diagnosing, assess the fix scope:
+      - 1 file → `single` (top-tier session AND >~30 lines → treat as a
+        coupled set of one: route `multi_coupled`, which delegates)
+      - 2+ files, tightly coupled (one logical chain, shared context) → `multi_coupled`
+      - 2+ files, independent (can be done in parallel with clear interfaces) → `multi_independent`
+      - root cause still unclear → `unclear` (add diagnostic logging and retry)
+    transitions:
+      single: fix_single
+      multi_coupled: load_skills_coupled
+      multi_independent: load_skills_delegate
+      unclear: add_logging
+
+  add_logging:
+    task: "Add diagnostic logging"
+    max_visits: 3
+    prompt: |
+      Root cause is still unclear. Gather more evidence:
+
+      1. Add targeted log/trace statements with unique prefixes (`[DBG1]`, `[DBG2]`)
+         at the locations you suspect — trace statements only, no structural changes
+      2. Re-run the reproduction and read the output
+      3. Analyze: does the output confirm or rule out a suspected location?
+
+      Budget: 3 visits to this state (engine-enforced); when nearly exhausted, choose `still_unclear` instead of retrying.
+
+      After analyzing, assess the fix scope (same as diagnose):
+      - 1 file → `single`
+      - 2+ files, tightly coupled → `multi_coupled`
+      - 2+ files, independent → `multi_independent`
+      - still no root cause → `still_unclear` (escalate to the user)
+    transitions:
+      single: fix_single
+      multi_coupled: load_skills_coupled
+      multi_independent: load_skills_delegate
+      still_unclear: escalate
+
+  fix_single:
+    sub_workflow: file-code
+    on_complete: review
+    on_fail: review
+
+  load_skills_coupled:
+    skills:
+      - coding-skill-selector
+      - ?project-skill-selector
+    transitions:
+      continue: fix_coupled
+
+  fix_coupled:
+    task: "Fix tightly coupled multi-file changes"
+    prompt: |
+      The fix spans multiple tightly coupled files (one logical chain, shared context).
+
+      Top-tier session AND >~30 changed lines expected → do NOT write inline:
+      write the fix plan + interface contracts here, spawn ONE implementer
+      agent carrying the whole plan (model per task-delegation: sonnet for a
+      detailed plan + linter/tests net, opus otherwise — never per-file
+      fan-out of a coupled set), collect its report, verify integration.
+      Otherwise (small fix, or non-top-tier session) do it yourself
+      sequentially — delegation overhead exceeds benefit:
+
+      1. Plan the order: start from the innermost change, work outward to callers
+      2. For each file: read → edit → self-review against loaded skills
+      3. After all files: verify cross-file consistency (imports, signatures, contracts)
+
+      Then → transition `done`.
+    transitions:
+      done: review
+
+  load_skills_delegate:
+    skills:
+      - coding-skill-selector
+      - ?project-skill-selector
+    transitions:
+      continue: fix_delegate
+
+  fix_delegate:
+    task: "Delegate per-file fixes to agents"
+    prompt: |
+      The fix spans multiple files. Produce a per-file plan with interface contracts,
+      then spawn one Agent per file for parallel implementation.
+      Use `subagent_type="general-purpose"`. ALWAYS pass an explicit `model`
+      (task-delegation's model table): `opus` for non-trivial fix logic,
+      `sonnet` for mechanical edits from the plan. Never silent session-model inheritance;
+      pass `effort` too (task-delegation table); fable only on user request.
+      With a difficulty set: `model` {{context.model_execute}}, `effort` {{context.effort_execute}}
+      (empty = no difficulty: the rule above); on a later visit read them with `status` + `key`.
+
+      For each file, include in the agent prompt VERBATIM:
+      ---
+      IMPORTANT: Override the default CLAUDE.md rule about start().
+      Do NOT call start() without arguments.
+      Instead, your FIRST action must be:
+        mcp__plugin_workflow_wf__start({ workflow: "file-code", parent_session_id: "<SESSION_ID>" })
+      where <SESSION_ID> is the current session ID (substitute it before sending).
+      Then follow the file-code workflow states until completion.
+      start() returns `SESSION: <id>` — pass that session_id explicitly in every subsequent workflow tool call (transition, context_set); parallel siblings share the same ppid.
+      ---
+      Also include:
+      - The file path
+      - The diagnosis and root cause
+      - The per-file fix plan
+      - Interface contracts with other files
+
+      Launch ALL file agents in ONE message, each with `run_in_background:
+      false` — their reports gate integration; a "batch" of ONE file is
+      still a gating single, not a background task.
+      Wait for all to complete. Collect reports.
+
+      After ALL reports are collected:
+      1. Abort orphaned child workflow sessions.
+      2. Transition `done`.
+    transitions:
+      done: integrate
+
+  integrate:
+    task: "Cross-file integration check"
+    prompt: |
+      All file agents have completed. Verify integration:
+
+      1. **Interface contracts** — do all files satisfy the contracts?
+      2. **Import resolution** — are all cross-file imports correct?
+      3. **Conflict resolution** — did agents make conflicting assumptions? Fix any.
+      4. **Missing glue** — any wiring code needed?
+
+      Fix any issues found directly. Then → transition `done`.
+    transitions:
+      done: review
+
+  review:
+    type: exec
+    command: "sh \"$WF_PLUGIN_ROOT/scripts/review-size.sh\""
+    cwd: "{{context.cwd}}"
+    env:
+      REVIEW_BASE: "{{context.review_base}}"
+      ROOT_WORKFLOW: "{{root_workflow}}"
+    cases:
+      "0": review_single
+      "10": review_delegate
+    default: review_route
+
+  # Fallback when review-size.sh cannot measure the diff (exit 2: not a
+  # repo, bad baseline) — the agent sizes it by hand.
+  review_route:
+    task: "Route review by scope"
+    prompt: |
+      The engine could not measure the diff (cwd not in a git repo, bad
+      baseline, or no change found there — e.g. the edits live in another
+      repo). Size it by hand.
+
+      Diff baseline: `HEAD`, unless context `review_base` (now:
+      "{{context.review_base}}") is set — by write_fix before a
+      fix round, or by code-review before handing its agreed changes over;
+      then size and review `git diff <review_base>`. Either way add untracked
+      files (`git ls-files --others --exclude-standard`): with a
+      `review_base`, those created or edited since it. A stale value only
+      over-reviews, never hides a change.
+
+      Route by SIZE of the change, not file count (`git diff <baseline> --numstat`):
+      - `single` → TRIVIAL change: ≤2 files AND ≤~50 changed lines total —
+        the linter IS the review (lint-review sub-workflow: engine-run lint
+        + act on findings + one intent re-read); tests follow anyway.
+      - `multi` → everything else, even one batch: an agent buys FRESH EYES
+        on the author's own code and keeps review bulk out of this session's
+        context; parallelism is a bonus, not the criterion.
+    transitions:
+      single: review_single
+      multi: review_delegate
+
+  review_single:
+    sub_workflow: lint-review
+    on_complete: review_decision
+    on_fail: write_fix
+
+  review_decision:
+    task: "Decide on review results"
+    prompt: |
+      The review sub-workflow completed (trivial path: lint-review fixes
+      findings inline; agent path: batch reports). Decide:
+      - `ok` → nothing unresolved, proceed to testing
+      - `fix` → unresolved issues remain, fix them
+    transitions:
+      ok: test
+      fix: write_fix
+
+  review_delegate:
+    task: "Delegate batched review to agents"
+    prompt: |
+      Diff baseline `<baseline>`: context `review_base` (now:
+      "{{context.review_base}}") if set — by write_fix before a fix round,
+      or by code-review before handing its agreed changes over — else
+      `HEAD`. Plus untracked files (`git ls-files --others
+      --exclude-standard`): with a `review_base`, only those modified since it.
+
+      Group the changed files into LOGICAL BATCHES, then spawn one Agent per
+      BATCH for deep review. Use `subagent_type="general-purpose"`.
+      Batching rules (strongest tie wins; a file joins exactly one batch):
+      source+test together; change-coupled files (for .hx with hxq:
+      `hxq importers`/`callees`); then by directory; cap at most 5 files AND
+      roughly 500 changed lines per batch, oversized files solo. A batch of
+      one is fine. Mass gate (overrides the file cap): batch by CHANGED-LINE
+      mass, not file count — mechanical one-line diffs (ratchet bumps, count
+      assertions, registrations) fold into the nearest logical batch, and a
+      would-be batch of under ~40 changed lines of purely mechanical/wiring
+      diffs gets NO agent at all — you review those lines inline at
+      cross_file. Structure/size queries for grouping (`git diff <baseline>
+      --numstat`, hxq graph queries) are fine — reviewing content is the
+      agents' job.
+
+      RE-ENTRY after a fix round (write_fix → review): review the FIX
+      DELTA only. Adversarial live-probing is owed ONLY to new or
+      reworked LOGIC in the delta; doc/comment/rename/test-tweak changes
+      get read-only review. Tell the reviewer agent what the previous
+      round already verified so it does not re-verify unchanged ground.
+
+      For each batch, include in the agent prompt VERBATIM:
+      ---
+      IMPORTANT: Override the default CLAUDE.md rule about start().
+      Do NOT call start() without arguments.
+      Instead, your FIRST action must be:
+        mcp__plugin_workflow_wf__start({ workflow: "file-review", parent_session_id: "<SESSION_ID>" })
+      where <SESSION_ID> is the current session ID (substitute it before sending).
+      Then follow the file-review workflow states until completion.
+      start() returns `SESSION: <id>` — pass that session_id explicitly in every subsequent workflow tool call (transition, context_set); parallel siblings share the same ppid.
+      ---
+      Also include:
+      - The batch's file list (absolute paths) and why they are grouped
+      - How to get the diffs: `git diff <baseline> -- <filepath>` per file
+        (substitute `<baseline>` with the sha or HEAD chosen above)
+        (a new/untracked file: read it whole)
+      - Review scope: `diff`
+      - "Report one section per file + a batch-level cross-file section."
+
+      ALWAYS pass an explicit `model`: `sonnet` for linter-covered/routine
+      batches, `opus` for macro-heavy / concurrency / engine-critical /
+      no-linter ones (opus wins on overlap). Never silent session-model inheritance;
+      pass `effort` too (task-delegation table); fable only on user request.
+      With a difficulty set: `model` {{context.model_review}}, `effort` {{context.effort_review}}
+      (empty = no difficulty: the rule above); on a later visit read them with `status` + `key`.
+
+      Launch up to 8 batch agents in ONE message, each with
+      `run_in_background: false` — reports gate the merge; a single batch
+      is still a gating single, not a background task. More batches →
+      next wave. Collect reports.
+
+      After ALL reports are collected:
+      1. Abort orphaned child workflow sessions.
+      2. Transition `done`.
+    transitions:
+      done: cross_file
+
+  cross_file:
+    task: "Cross-file review analysis"
+    prompt: |
+      Review the big picture. Seams WITHIN a batch are already covered by
+      that batch agent's cross-file section — do not re-derive them; focus
+      on seams BETWEEN batches and on set-wide patterns (these apply even
+      when there was only one batch):
+      - [ ] Duplication across files
+      - [ ] Missing updates to consumers of changed interfaces
+      - [ ] Consistency across files
+      - [ ] Integration between changed components
+      - [ ] Agent-less batches: lines the mass gate kept without a reviewer
+            agent get their ONLY review here — read their diff now
+
+      Choose:
+      - `ok` → no issues, proceed to testing
+      - `fix` → found issues that need fixing
+    transitions:
+      ok: test
+      fix: write_fix
+
+  write_fix:
+    task: "Fix review issues"
+    prompt: |
+      Fix the issues found — review findings or test failures reported by the
+      testing workflow (read the failure report for what broke).
+
+      BEFORE the first edit: `context_set(key: "review_base", value: <sha>)` — <sha> = the output of
+      `git stash create` (a snapshot of the dirty tree; the tree itself is
+      untouched), or — when it prints nothing (clean tree) — a fresh commit of
+      HEAD's tree: `git commit-tree "HEAD^{tree}" -p HEAD -m review-base`
+      (a dangling object: no branch or ref changes, nothing enters history;
+      its date lets review routing skip files that predate this round;
+      `git rev-parse HEAD` only if commit-tree fails).
+      The re-entry review then sees the fix delta only.
+
+      Size the round BEFORE delegating. A NIT round — assertions, doc
+      lines, renames, comment rewording: ≤~30 changed lines and NO new or
+      reworked logic — is done INLINE by the orchestrator, top-tier
+      included (a delegated nit round pays a full agent's fixed cost for
+      trivial work). Delegate only when the fix set introduces or reworks
+      logic; then prefer resuming the ORIGINAL implementer (SendMessage)
+      over a fresh agent — its context is already paid for.
+
+      After fixing → transition `done` (returns to review for re-verification).
+    transitions:
+      done: review
+
+  test:
+    sub_workflow: testing
+    on_complete: verify_route
+    on_fail: write_fix
+
+  verify_route:
+    type: exec
+    command: 'case "$BUG_TYPE" in logic) exit 0;; visual) exit 10;; *) exit 2;; esac'
+    env:
+      BUG_TYPE: "{{context.bug_type}}"
+    cases:
+      "0": done
+      "10": load_skills_verify
+    default: verify_route_manual
+
+  # Fallback when context bug_type is missing or unrecognized.
+  verify_route_manual:
+    task: "Route to correct verification"
+    prompt: |
+      Bug type classified at the start: "{{context.bug_type}}" — missing or
+      unrecognized (context was lost). Re-classify now: was the original report a
+      visual problem or a logic problem? Persist it for later rounds:
+      `context_set({ key: "bug_type", value: "visual" })` (or `"logic"`).
+
+      - Visual bug → `visual` (needs screenshot verification)
+      - Logic bug → `logic` (tests already passed in testing workflow)
+    transitions:
+      visual: load_skills_verify
+      logic: done
+
+  load_skills_verify:
+    skills:
+      - coding-skill-selector
+      - ?debug-bridge
+      - ?project-skill-selector
+    transitions:
+      continue: project_build
+
+  # Extension point (contract name): BUILD the fixed app before the visual
+  # check. A project heir (`extends: bug-fix`) replaces it with an exec —
+  # on_success verify_visual, on_error write_fix.
+  project_build:
+    task: "Build the fixed app"
+    prompt: |
+      Build the app with the fix (if applicable — native targets must be
+      built before launch) via a flat `general-purpose` subagent — it ONLY
+      builds; pass `model: "haiku"`, `effort: "low"` explicitly (runner, not
+      judge), foreground with a timeout sized to the build,
+      `run_in_background: false`, and tell it to quote every error VERBATIM.
+      Nothing to build (interpreted / web dev server) → `built`.
+
+      - `built` → build succeeded (or nothing to build)
+      - `failed` → build broken by the fix
+    transitions:
+      built: verify_visual
+      failed: write_fix
+
+  verify_visual:
+    task: "Verify the fix visually"
+    prompt: |
+      Verify the original bug is fixed VISUALLY.
+
+      Tool chosen at reproduction: {{context.chosen_tool}}
+      (If empty — context was lost. Re-pick a tool now using the same approach
+      as reproduce_visual: check available MCP tools, pick the one matching the
+      platform.)
+
+      MANDATORY STEPS (the app was built in `project_build`):
+      1. Launch the app using the tool above
+      2. Follow the SAME path used during reproduction
+      3. Take a screenshot and VERIFY the bug is gone
+      4. Compare before/after — describe the visual difference
+
+      DO NOT transition to `confirmed` without a screenshot proving the fix works.
+
+      Choose transition:
+      - `confirmed` → your screenshot proves the bug is gone
+      - `still_broken` → bug still visible, back to diagnosis
+    transitions:
+      confirmed: done
+      still_broken: diagnose
+
+  clarify:
+    task: "Clarify bug details"
+    prompt: |
+      You could not reproduce the bug. Ask the user for more details:
+      - Exact steps to reproduce
+      - Error messages, logs, or screenshots
+      - Environment (platform, version, configuration)
+
+      If there is no interactive user (you are running as a subagent), do NOT ask — state your assumptions and continue, or take the failure path.
+
+      Choose transition:
+      - `got_info_visual` → new details point to a visual reproduction attempt
+      - `got_info_logic` → new details point to a test/log reproduction attempt
+      - `escalate` → no way to get more information; give up
+    transitions:
+      got_info_visual: load_skills_visual
+      got_info_logic: reproduce_logic
+      escalate: escalate
+
+  escalate:
+    prompt: "Could not reproduce or diagnose the bug. Report to the user: what was tried, what was ruled out, what information would help."
+    terminal: true
+    outcome: fail
+
+  done:
+    prompt: "Bug fixed and verified."
+    terminal: true
