@@ -1,0 +1,14 @@
+node_modules
+build/
+.DS_Store
+.playwright-mcp/
+
+# Override global gitignore for Claude plugin files
+!CLAUDE.md
+!.mcp.json
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+video/.venv/
+video/cache/
+video/out/
+video/voice-sample.*

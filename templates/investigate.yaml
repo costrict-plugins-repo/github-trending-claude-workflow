@@ -1,0 +1,102 @@
+name: investigate
+description: "Investigation workflow — resolve unknowns before deciding on action. For tasks that describe desired changes but contain questions, uncertainties, or assumptions that need verification first."
+initial: parse
+max_transitions: 25
+
+states:
+  parse:
+    prompt: |
+      The user's task contains unknowns that need investigation before coding.
+
+      1. Extract from the user's message:
+         - **Goal**: what the user ultimately wants changed
+         - **Unknowns**: questions, uncertainties, assumptions to verify
+           (markers: "seems like", "I think", "if that's the case", "not sure",
+            "should", "?", conditional language, hedging)
+         - **Knowns**: concrete facts or behaviors stated as certain
+
+      2. Formulate 1-3 specific investigation questions to resolve the unknowns
+
+      Present the breakdown to the user briefly, then → transition `explore`.
+    transitions:
+      explore: run_explore
+
+  run_explore:
+    sub_workflow: explore
+    on_complete: assess
+    on_fail: assess
+
+  assess:
+    prompt: |
+      Investigation finished — successfully or not (a failed exploration also
+      lands here; treat missing findings as unresolved unknowns).
+      Review findings against the original unknowns.
+
+      Present to the user:
+      1. For each unknown — what did investigation reveal?
+      2. Does the desired change still make sense given the findings?
+      3. Recommended action and scope
+
+      Choose transition:
+      - `trivial` → fix is obvious and small (1-3 lines); it will be applied in
+        the quick_fix state after the skill gate — do NOT apply it here
+        **Before choosing trivial, verify ALL:**
+        ☐ Only 1 file changed
+        ☐ No UI positioning/layout/scaling involved (needs visual verification)
+        ☐ No unknowns about API behavior in the fix path
+        If any check fails → `needs_plan`
+      - `investigate_more` → findings raised new specific questions that need
+        another exploration round
+      - `needs_plan` → changes needed but require planning (multi-file, risk, unclear scope)
+      - `no_action` → investigation showed the change is unnecessary or already works correctly
+      - `unclear` → still unclear after investigation, need user input
+    transitions:
+      trivial: load_skills
+      investigate_more: run_explore
+      needs_plan: needs_plan
+      no_action: done
+      unclear: clarify
+
+  clarify:
+    prompt: |
+      Present findings and remaining questions to the user.
+      Use AskUserQuestion for critical decisions.
+
+      If there is no interactive user (you are running as a subagent), do NOT
+      ask — state your assumptions and continue, or take the failure path.
+
+      After getting user's answer → transition based on clarity:
+      - `reassess` → re-evaluate with new info
+      - `done` → user says no action needed
+    transitions:
+      reassess: assess
+      done: done
+
+  load_skills:
+    skills:
+      - coding-skill-selector
+      - ?project-skill-selector
+    transitions:
+      continue: quick_fix
+
+  quick_fix:
+    prompt: |
+      The fix is trivial (1-3 lines). Apply it directly.
+      After fixing → transition `done`.
+    transitions:
+      done: fixed
+
+  fixed:
+    prompt: "Investigation + quick fix complete."
+    terminal: true
+    outcome: complete
+
+  needs_plan:
+    prompt: "Investigation complete. Changes need planning — escalating."
+    terminal: true
+    outcome: fail
+
+  done:
+    prompt: "Investigation complete. No code changes needed."
+    terminal: true
+    outcome: complete

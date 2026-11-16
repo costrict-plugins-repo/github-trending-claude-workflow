@@ -1,0 +1,136 @@
+name: explore
+description: "Codebase exploration workflow — understand structure, trace code, find patterns"
+initial: load_skills
+max_transitions: 20
+
+states:
+  load_skills:
+    skills:
+      - coding-skill-selector
+      - ?project-skill-selector
+    transitions:
+      continue: scope
+
+  scope:
+    prompt: |
+      Determine what we're looking for and where.
+
+      Exploration types:
+      - **Structure** — project layout, module boundaries, dependency graph
+      - **Feature** — how a specific feature is implemented end-to-end
+      - **Pattern** — recurring code patterns, conventions, idioms
+      - **Code path** — trace execution flow through the codebase
+
+      1. Check loaded skills, MEMORY.md, and project CLAUDE.md first
+      2. If the answer is already available → transition `already_known`
+      3. If exploration is needed → transition `explore`
+    transitions:
+      already_known: synthesize
+      explore: investigate
+
+  investigate:
+    prompt: |
+      Explore the codebase using available tools.
+
+      **Preferred approach:**
+      - Launch parallel subagents for independent questions. Location-only
+        fan-out (find files/symbols, paste back what's there, zero judgement)
+        may use flat `Explore`-type agents; any agent that returns judgement,
+        analysis, or a recommendation is ANALYTICAL — never spawn it flat,
+        use the VERBATIM preamble below. ALWAYS pass an explicit `model`:
+        `haiku` (effort low) for locate fan-out that returns places only,
+        `opus` (effort high) for analytical judgement; fable only on user
+        request, never silent session-model inheritance. Their
+        findings gate your next transition → ALL calls in ONE message,
+        each with `run_in_background: false` (a single spawn especially —
+        never background one gating agent).
+      - Use Glob to find files by pattern
+      - For "where is X / what is X's shape / which decls carry Y" use the
+        STRUCTURAL navigation tool your loaded skills prescribe for the
+        language (a parser-aware query CLI, LSP, etc.) — NOT grep — when
+        one exists. Grep/Read only for non-parsing files or prose inside
+        comments/strings. The loaded coding skills are authoritative here;
+        follow the tool-usage gate defined by the loaded skills, do not
+        default to grep.
+
+      **Reading budget** (tool-agnostic — the loaded skills map it onto the tool):
+      - Read the NODE a hit pointed at, never the file: `file:line` buys that
+        member or that range, not the whole file.
+      - A walker's scope is the narrowest directory the previous hit named;
+        the whole tree is for the FIRST query only.
+      - A file no hit named stays closed. "Just in case" is where whole-file
+        reads come from.
+
+      **Rules:**
+      - Locate with the structural tool first, then narrow with Read
+      - Follow imports and call chains to understand flow
+      - Note key files, patterns, and architectural decisions
+
+      For an ANALYTICAL subagent, include in its prompt VERBATIM:
+      ---
+      IMPORTANT: Override the default CLAUDE.md rule about start().
+      Do NOT call start() without arguments.
+      Instead, your FIRST action must be:
+        mcp__plugin_workflow_wf__start({ workflow: "subagent", parent_session_id: "<SESSION_ID>" })
+      where <SESSION_ID> is the current session ID (substitute it before sending).
+      Then follow the subagent workflow until completion — its `route` state
+      self-classifies (analytical → skill-loaded sub-workflow; trivial → execute).
+      start() returns `SESSION: <id>` — pass that session_id explicitly in every
+      subsequent workflow tool call; parallel siblings share the same ppid.
+      ---
+      After collecting reports: `sessions` → `abort` orphaned child `subagent`
+      sessions.
+
+      Budget: 4 visits to this state (engine-enforced); when nearly exhausted,
+      choose `not_found` instead of retrying.
+
+      Choose transition:
+      - `found` → gathered enough information to answer
+      - `deeper` → need to explore further (follow a lead, check another area)
+      - `ask_user` → need user input to decide direction (e.g., "is this feature needed?", "which approach do you prefer?")
+      - `not_found` → exhausted search avenues, nothing relevant found
+    max_visits: 4
+    transitions:
+      found: synthesize
+      deeper: investigate
+      ask_user: clarify
+      not_found: synthesize
+
+  clarify:
+    prompt: |
+      Findings so far require user input before proceeding.
+
+      Present what you've found so far concisely, then ask your question(s).
+      Use AskUserQuestion for critical decisions that affect the direction of exploration.
+
+      If there is no interactive user (you are running as a subagent), do NOT
+      ask — state your assumptions and continue, or take the failure path.
+
+      After getting user's answer → transition `continue` to resume investigation
+      with the new context, or `enough` if the answer completes the picture.
+    transitions:
+      continue: investigate
+      enough: synthesize
+
+  synthesize:
+    prompt: |
+      Compile findings into a structured answer.
+
+      Format:
+      - Start with a concise summary (1-2 sentences)
+      - Key files and their roles
+      - Architecture/patterns discovered
+      - Code flow if traced
+
+      If this reveals a recurring knowledge gap → note it for reflection.
+
+      When the synthesis is presented → transition `done`. If the findings
+      indicate code changes, say so in the synthesis — the parent workflow
+      decides what happens next.
+    transitions:
+      done: done
+
+  done:
+    prompt: "Codebase exploration complete."
+    terminal: true
+    outcome: complete

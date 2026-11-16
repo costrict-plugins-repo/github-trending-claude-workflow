@@ -1,0 +1,427 @@
+name: file-review
+description: "Deep review of one file or a small coupled batch — spawned as an agent per batch, or run inline as a sub-workflow for a single file"
+initial: probe_hxq
+max_transitions: 25
+map: false
+
+states:
+  # Spawned agents start a fresh session — parent context does not carry over,
+  # so tool availability is probed here, deterministically, by the engine.
+  probe_hxq:
+    type: exec
+    command: "command -v hxq >/dev/null 2>&1 && HXQ_QUIET=1 hxq probe 'class C{}' >/dev/null 2>&1"
+    timeout: 15000
+    context_set:
+      hxq_available: "true"
+    on_success: load_skills
+    on_error: load_skills
+
+  load_skills:
+    skills:
+      - coding-skill-selector
+      - ?project-skill-selector
+    transitions:
+      continue: read_context
+
+  read_context:
+    task: "Read file and context"
+    prompt: |
+      You are reviewing ONE file or a small COUPLED BATCH as part of a code
+      review. The file list, why the files are grouped, and diff info come
+      from your task prompt (spawned agent) or from the conversation so far
+      (inline sub-workflow). Every "this file" below means "each file in
+      your batch"; read the batch's shared context (imports, siblings) once,
+      and also check the seams the grouping names (caller↔callee, test↔source).
+
+      1. Read the diff for this file to understand what changed.
+      2. Check the review scope from your task prompt:
+         - `diff` scope → read the diff, then read the full methods/blocks containing changes.
+           Changes can affect surrounding code, so always understand the logical context.
+         - `full` scope → read the FULL file
+      3. Read related files: imports, files that call this one, siblings in the same module.
+         Check if similar code already exists elsewhere that could be reused or unified.
+      4. Understand what changed and why.
+      5. Save the file path(s) for the engine's mechanical pass — MUST be
+         absolute (the engine's exec cwd is the server's, not the reviewed
+         project's); a batch = one space-separated value (paths containing
+         spaces are unsupported in batch mode):
+         `context_set(key: "file_path", value: "<ABSOLUTE path(s), space-separated>")`
+      6. hxq availability (engine probe): "{{context.hxq_available}}" (empty = unavailable).
+         If it is non-empty, any batch file is .hx, and `Skill("hxq")` was not loaded
+         at the skill gate → load it now (top-up); if empty, do not attempt hxq at all.
+
+      Then → transition `done`.
+    transitions:
+      done: mechanical_probe
+
+  # Engine-run lint pass — the agent cannot skip or water it down. The script
+  # self-gates (non-.hx file or missing hxq → "SKIP: ..." output, exit 0).
+  # LINT_LIST_RULES=1 prepends the rule state hxq actually runs for these
+  # files (on/off per rule, per config chain): build_checklist subtracts by it
+  # instead of spending a call on --list-rules.
+  # Runs before authorship is known on purpose: for external/vendored files
+  # the report is computed and then dropped by build_checklist — acceptable
+  # cost for keeping the exec chain linear. The path goes via env, not
+  # template interpolation into sh -c: a hostile filename ($(cmd).hx) in a
+  # reviewed repo must not execute.
+  #
+  # The probe self-gates first, without a lease: nothing to lint (non-.hx,
+  # no hxq) stores its SKIP lines and exit 0 skips the pass; exit 10 (work)
+  # or anything else runs it.
+  mechanical_probe:
+    type: exec
+    command: "sh \"$WF_PLUGIN_ROOT/scripts/hxq-lint-file.sh\" \"$REVIEW_FILE\""
+    env:
+      REVIEW_FILE: "{{context.file_path}}"
+      LINT_PROBE: "1"
+    context_set:
+      lint_report: "{{stdout}}"
+    cases:
+      "0": determine_authorship
+    default: mechanical_pass
+
+  # A lint with a compiler oracle builds the project: up to one haxe per
+  # configuration at once, each a single-threaded process. The lease caps
+  # that at 4 (the script hands WF_THREADS to APQ_ORACLE_PARALLEL): a fixed
+  # share, not `budget`, so a review runs beside a suite instead of waiting
+  # for an empty machine; priority 1 — a short step an agent waits on goes
+  # ahead of queued suites (never of running ones). No wait_timeout: the
+  # report is load-bearing, an abort withdraws the wait.
+  mechanical_pass:
+    type: exec
+    command: "sh \"$WF_PLUGIN_ROOT/scripts/hxq-lint-file.sh\" \"$REVIEW_FILE\""
+    env:
+      REVIEW_FILE: "{{context.file_path}}"
+      LINT_LIST_RULES: "1"
+      LINT_PROBE: "0"
+    resource: { threads: 4, priority: 1 }
+    timeout: 120000
+    max_output: 204800
+    context_set:
+      lint_report: "{{stdout}}"
+    on_success: determine_authorship
+    on_error: determine_authorship
+
+  determine_authorship:
+    task: "Determine code authorship"
+    prompt: |
+      Decide whether this file is user-authored or external/forked/vendored —
+      this gates which personal rules apply downstream (style + architecture).
+
+      Strong signals it is external / forked / vendored (set "false"):
+      - `git remote -v` points to a third-party upstream the user does not control.
+      - README/CLAUDE.md mentions "fork of X", "based on X", "vendored from X".
+      - Path lives under `node_modules/`, `vendor/`, `third_party/`, a haxelib
+        cache, or similar dependency location.
+
+      Save the verdict:
+      - ANY strong external signal present → `context_set({ key: "is_user_authored", value: "false" })`
+      - Otherwise → `context_set({ key: "is_user_authored", value: "true" })`
+
+      Default to "true" when signals are ambiguous — external markers are reliably
+      detectable; user-authored markers are not, so ambiguity falls on the
+      personal-rules side. Do not block on user input.
+
+      Then → transition `done`.
+    transitions:
+      done: build_checklist
+
+  build_checklist:
+    task: "Build style checklist from skills"
+    prompt: |
+      **Step 1 — mechanical-pass verdict (run this whatever the authorship —
+      the linter's report is about the code, not about who wrote it).**
+      The engine already ran the project linter on this file; its report:
+      ---
+      {{context.lint_report}}
+      ---
+      Decide ONCE what the linter verified, and record it for the
+      downstream states — they read these two keys and never re-derive them:
+      - USABLE = non-empty, the `=== hxq lint` / `=== fmt drift` headers name
+        THIS batch's files, and so do the `file:` lines under each
+        `=== effective lint rules` block (other files anywhere = stale report
+        from an earlier pass in a reused session), and the lint section is
+        real output — not "SKIP: ..." and not a mid-report "SKIP: hxq lint
+        failed" (a broken linter verified nothing). Per-file SKIP lines for
+        the batch's non-.hx files are normal — the report is usable for the
+        .hx files it covers; but a report with NO `===` lint section at all
+        (only SKIP lines) is NOT usable.
+      - NOT usable → `context_set(key: "lint_subtraction", value: "none")`
+        and `context_set(key: "lint_rules_ran", value: "")`.
+      - USABLE → its findings are review facts: carry them into your report
+        as-is, whatever the rule-state section says. Then read that section:
+        - `=== hxq lint rules: effective state per file` → one block per
+          config chain, each listing its `file:` lines and then
+          `<rule-id>  on|off  <reason>  <description>` per rule. A rule
+          counts as RAN only if it is `on` in the block of EVERY batch .hx
+          file (a rule on for some files only stays manual for the whole
+          batch). Record them:
+          `context_set(key: "lint_rules_ran", value: "<comma-separated ids>")`
+          and `context_set(key: "lint_subtraction", value: "applied")`.
+          `off` rules — config-disabled, `default-off` (opt-in, never
+          enabled), `needs-language-<v>`, `needs-config` / `config-excluded`
+          / `config-noop` (the rule's own options skip that file) — did NOT
+          run: never subtract them. A batch file carrying a
+          `// CHECKSTYLE:OFF` region had its findings there suppressed, so
+          nothing was verified for that code: subtract nothing for that file
+          (a `// noqa` line likewise leaves that line to you).
+        - `=== hxq lint rules: registry only` (hxq too old to report the
+          effective state), `=== hxq lint rules: unavailable`, a SKIP there,
+          or no rule-state section at all → the linter's coverage is
+          unknown: subtract nothing. Record
+          `context_set(key: "lint_rules_ran", value: "")` and
+          `context_set(key: "lint_subtraction", value: "none")`.
+
+      **Step 2 — authorship gate.** Check `{{context.is_user_authored}}`.
+      Treat empty as `"true"` (default).
+      If `"false"` → personal style rules do not apply. Output:
+      "Skipping personal-style checklist — file is external/forked/vendored.
+      check_style will use only language-agnostic checks."
+      Then → transition `done` (the Step 1 verdict still stands: downstream
+      states subtract by it for their language-agnostic checks).
+
+      **Step 3 — build the checklist out of what is LEFT.**
+      Process the bare `preferences` skill plus each loaded `lang-*` and
+      `preferences-*` skill ONE AT A TIME.
+      For each skill:
+      1. Re-read the FULL skill text
+      2. For EVERY rule in it — each `// WRONG` example, explicit rule, or
+         convention:
+         - subtraction "applied" AND a rule in `lint_rules_ran` covers it →
+           DROP it, write no check line. Subtract at rule granularity: a rule
+           covers exactly what its description says, no more.
+         - otherwise → one line with the wrong pattern AND the correct one
+      3. Output this skill's kept count and dropped count
+
+      Do NOT summarize, group, or prioritize — every kept rule matters equally.
+      Rules no linter can verify always stay: comment quality, abstraction
+      threshold, naming semantics, API shape, domain correctness.
+
+      With subtraction "none" nothing is dropped — and if your total is then
+      under 25 rules across all skills, you missed some: re-read.
+
+      Escape hatch: if NO lang/preferences skills apply to this file type
+      (e.g. config, YAML, docs), state so explicitly and continue — the
+      language-agnostic checks in the following states still run.
+
+      Output the full checklist, then → transition `done`.
+    transitions:
+      done: check_correctness
+
+  check_correctness:
+    task: "Check correctness"
+    prompt: |
+      Check based on review scope (`diff` or `full`).
+      For `diff` scope: changed lines are entry points, but always check the
+      logical context around them — the full method, callers of changed signatures,
+      other uses of changed fields. A change can break surrounding code.
+
+      If `{{context.lint_subtraction}}` is "applied", the linter ran exactly
+      these rules: `{{context.lint_rules_ran}}` — their findings are in the
+      report. Do not re-derive by hand what THOSE rules cover (e.g.
+      `null-dereference`, `dead-null-guard`, `swallowed-exception`,
+      `dead-code`, `identical-operands`, `assignment-in-condition` — each only
+      if it is in that list). Anything not in the list is still yours.
+      Your job here is the part no linter can prove: whether the logic is
+      what the change INTENDED.
+
+      - [ ] Logic errors: wrong conditions, off-by-one, inverted booleans, wrong operators
+      - [ ] Dead guards: for EVERY guard/early-return/conditional check in changed code,
+            trace all call sites and ask "can this condition ever be true/false here?"
+            Apply knowledge from loaded skills (e.g. library callback ordering, lifecycle
+            guarantees). If no execution path triggers the guard — it's dead code, remove it.
+      - [ ] Edge cases: null/undefined, empty collections, zero, negative, boundary values
+      - [ ] Error handling: uncaught exceptions, swallowed errors, wrong error types
+      - [ ] Race conditions: async without awaits, shared mutable state
+      - [ ] Resource leaks: unclosed handles, missing cleanup in error paths
+      - [ ] Type mismatches: wrong argument types, unsafe casts
+      - [ ] Regression risk: does this break existing callers or assumptions?
+
+      Then → transition `done`.
+    transitions:
+      done: check_loops
+
+  check_loops:
+    task: "Audit every loop and iteration pattern"
+    prompt: |
+      Find loops based on review scope (`diff` = only loops in changed code, `full` = ALL loops in file). For each one, output:
+
+        Line <N>: `<the loop header>` — iterates <what> to access <what> → verdict: ok / issue
+
+      Check each loop against these anti-patterns. The examples are
+      Haxe-flavored — translate each pattern to the file's language.
+      Rules 5-6 are personal style preferences — apply them ONLY when
+      `{{context.is_user_authored}}` is not "false" (treat empty as "true");
+      for external/forked/vendored code check rules 1-4 only.
+      If `{{context.lint_subtraction}}` is "applied", skip a rule below ONLY
+      when its counterpart rule id is in `{{context.lint_rules_ran}}`: 2 ↔
+      `map-keys-lookup`, 5 ↔ `loop-guard`, 6 ↔ `prefer-switch`. Rules 1, 3
+      and 4 are pure judgment, owned by no linter — walk EVERY loop for those.
+
+      1. **Range-over-sparse-container**: the loop iterates an index range (`0...n`,
+         `i++`) but uses the index to look up a Map/Dict/HashMap, with a null check
+         to skip missing entries. This means the container is sparse and should be
+         iterated directly instead of via index range.
+         WRONG: `for (i in 0...n) { val = map[i]; if (val == null) continue; ... }`
+         RIGHT: `for (key => val in map) { ... }` (with filter if needed)
+
+      2. **Keys-then-lookup**: iterates `.keys()` then does a separate `map[key]`
+         lookup inside the body. Use key-value destructuring instead.
+         WRONG: `for (k in map.keys()) { v = map[k]; ... }`
+         RIGHT: `for (k => v in map) { ... }`
+
+      3. **Repeated linear scan**: the same collection is scanned multiple times in
+         the same method or call chain to find related data that could be found in
+         a single pass.
+
+      4. **Wrong container for access pattern**: Array with `.contains()` checks
+         (should be Set/Map), unsorted Array with binary-search-like access, etc.
+
+      5. **Continue instead of guard**: when a single condition filters the entire
+         loop body, use guard-style `for (...) if (cond) {` instead of
+         `if (!cond) continue;`. But when multiple independent checks follow
+         sequentially (each with its own variable), `continue` is fine.
+         WRONG: `for (x in list) { if (x.type != Foo) continue; doWork(x); }`
+         RIGHT: `for (x in list) if (x.type == Foo) { doWork(x); }`
+         OK:    `for (f in range) { val = map[f]; if (val == null) continue; ... }`
+
+      6. **If/else-if chain instead of switch**: when a loop body checks the same
+         variable with `if/else if` chain (e.g. `if (x == "a") ... else if (x == "b")`),
+         use `switch` instead — cleaner, exhaustive, idiomatic.
+         WRONG: `if (node.name == "a") { ... } else if (node.name == "b") { ... }`
+         RIGHT: `switch node.name { case "a": ... case "b": ... }`
+
+      You MUST list ALL loops with verdicts. Do not summarize or skip "obvious" ones.
+
+      Then → transition `done`.
+    transitions:
+      done: check_style
+
+  check_style:
+    task: "Check code style"
+    prompt: |
+      Authorship: `{{context.is_user_authored}}` (set in determine_authorship).
+      Treat empty as `"true"` (default).
+
+      If `"false"` (external / forked / vendored):
+      Skip the personal-style checklist entirely. Match THAT codebase's existing
+      style — a one-line patch into a foreign project should look like it belongs.
+      Only flag issues from the language-agnostic checks below.
+
+      Otherwise (user-authored):
+      Go through EVERY item in your style checklist from build_checklist.
+      Personal rules are authoritative — a neighboring file violating the same
+      rule is a bug replicated in both places, not a valid pattern. Flag it.
+      Never dismiss a checklist hit with "the sibling does it this way".
+
+      Scope: `diff` = scan only lines in the diff; `full` = scan entire file.
+      If a line appears in the diff, it is part of the change and must meet
+      current style standards. Report with file:line.
+
+      If `{{context.lint_subtraction}}` is "applied", skip the parts of the
+      items below that a rule in `{{context.lint_rules_ran}}` already
+      verified and hand-check only the residues those rules' descriptions
+      do not cover — e.g. "function doing too many things" beyond the
+      cyclomatic threshold, semantics of names (the `naming` rule checks the
+      convention, not whether the name says the right thing), commented-out
+      code, consistency judgments against this module's patterns.
+
+      Language-agnostic checks (apply regardless of authorship):
+      - [ ] Missing type annotations: if a variable/field/parameter has no explicit type
+            and adding one would improve clarity, recommend it — but ONLY after you find
+            the actual type definition in the codebase (via Grep/Read). Never guess types.
+            Use short type names + import, not fully qualified paths (e.g. `MyClass`,
+            not `com.package.MyClass`) — unless a name conflict or conditional compilation
+            requires the full path (check loaded lang/preferences skills for specifics).
+      - [ ] Naming: consistent with the conventions of THIS codebase (the user's own
+            for user-authored, the upstream's for external).
+      - [ ] Member ordering: new fields and methods must respect class member order
+            (constants → public vars → private vars → constructor → instance methods →
+            static methods). Check that added code is in the right section, not just
+            appended next to related code.
+      - [ ] Duplication: does this duplicate existing code? Search the codebase.
+      - [ ] Dead code: unused imports, commented-out code (dead guards checked in check_correctness).
+            Imports used only inside conditional-compilation blocks are dead in
+            the other branches — reference such symbols via fully qualified name
+            inside the conditional block instead of adding a top-level import.
+      - [ ] Complexity: overly nested logic, functions doing too many things
+      - [ ] Consistency: does new code follow patterns in the same module of THIS
+            codebase? (For user-authored code, this means the user's own conventions —
+            not a license to replicate violations from sibling files.)
+
+      Then → transition `done`.
+    transitions:
+      done: check_architecture
+
+  check_architecture:
+    task: "Check architecture"
+    prompt: |
+      Authorship: `{{context.is_user_authored}}` (set in determine_authorship).
+      Treat empty as `"true"` (default).
+
+      Check structural quality (scope: `diff` = changed code, `full` = entire file).
+
+      Language-agnostic checks (apply regardless of authorship):
+      - [ ] Unnecessary indirection: wrapper classes/methods that just forward calls
+      - [ ] Dead abstractions: interface with one implementation, base class with one subclass
+      - [ ] God class: file doing too many unrelated things — should it be split?
+      - [ ] Overcomplicated: deep inheritance or nesting that could be flattened
+      - [ ] Wrong level: logic placed in the wrong layer (UI doing data work, model doing display)
+      - [ ] Stale patterns: old patterns that predate current codebase conventions
+      - [ ] Complexity without pain: abstractions, patterns, or layers added for hypothetical future needs
+
+      Architecture-skill checks (skip ONLY when `is_user_authored` is `"false"`):
+      - [ ] Initialization in parent: parent manually triggers component's internal setup — should be inside the component
+      - [ ] Serialization in runtime state: serialize/deserialize mixed into state classes — should be separate
+      - [ ] Event re-dispatch duplication: re-dispatched event carries fields that duplicate event.target
+
+      Only flag real simplification opportunities — don't invent hypothetical improvements.
+
+      Then → transition `done`.
+    transitions:
+      done: check_security
+
+  check_security:
+    task: "Check security"
+    prompt: |
+      Check code for security issues (scope: `diff` = changed code, `full` = entire file):
+      - [ ] Injection: unsanitized inputs reaching dangerous APIs
+      - [ ] Auth/authz: missing or insufficient access controls
+      - [ ] Data exposure: secrets, credentials, or sensitive data leaking
+      - [ ] Input validation: missing validation at system boundaries
+      - [ ] Unsafe operations: anything exploitable by malicious input
+
+      Only flag real risks — don't invent hypothetical issues.
+      Then → transition `done`.
+    transitions:
+      done: report
+
+  report:
+    task: "Write file review report"
+    prompt: |
+      Write a structured report — ONE section per batch file, then (for a
+      multi-file batch) a closing **Cross-file** section for findings on the
+      seams between them. Per file:
+
+      **File**: <path>
+      **What changed**: <one-paragraph summary of the changes>
+      **Issues found**:
+      For each issue:
+      - Severity: bug / risk / style / nit / pre-existing
+        (`pre-existing` = issue outside the changed lines, found during
+        a diff-scope review — report separately, do NOT mix with diff issues)
+      - Line: <line number>
+      - Description: <what's wrong>
+      - Suggestion: <how to fix>
+
+      If no issues found, say so explicitly.
+
+      Output this report — as your final response (spawned agent) or into the
+      conversation for the parent workflow (inline sub-workflow).
+      Then → transition `done`.
+    transitions:
+      done: finish
+
+  finish:
+    terminal: true
+    outcome: complete

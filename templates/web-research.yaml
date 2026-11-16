@@ -1,0 +1,65 @@
+name: web-research
+description: "Web research workflow — check existing knowledge, then delegate to web subagents"
+initial: check_existing
+max_transitions: 20
+
+states:
+  check_existing:
+    prompt: |
+      Before researching externally, check what you already know:
+
+      1. Check loaded skills and MEMORY.md
+      2. Check project documentation (CLAUDE.md, README)
+
+      Choose transition:
+      - `already_known` → the answer is already available, or the task is
+        routine and you are confident
+      - `need_research` → existing knowledge is not enough
+    transitions:
+      already_known: apply
+      need_research: load_skills
+
+  load_skills:
+    skills:
+      - web-reading
+    transitions:
+      continue: delegate
+
+  delegate:
+    prompt: |
+      Delegate to `general-purpose` subagents with explicit `model: "haiku"`, `effort: "low"`
+      (fetch/extract fan-out — synthesis stays here; never inherit the
+      session model):
+      - Split broad questions into 3-5 narrow ones, launch in parallel
+      - Each returns only a concise answer
+      - Follow the tool hierarchy from the loaded web-reading skill
+      - Extract ONLY what's needed
+
+      Choose transition:
+      - `found` → got the answer, ready to apply
+      - `not_found` → could not find reliable information. BEFORE transitioning,
+        write a negative-result report: what was searched, which sources were
+        checked, and what exactly could not be found — the parent workflow sees
+        only your report, not your search history.
+    transitions:
+      found: apply
+      not_found: failed
+
+  apply:
+    prompt: |
+      Apply the existing or newly researched knowledge to the current task.
+
+      If this reveals a recurring knowledge gap → note it for reflection.
+
+      Choose transition:
+      - `done` → knowledge applied to the task
+    transitions:
+      done: done
+
+  done:
+    prompt: "Web research complete."
+    terminal: true
+
+  failed:
+    terminal: true
+    outcome: fail

@@ -1,0 +1,190 @@
+#!/bin/bash
+# SessionStart hook: detect context (new session / plan resume / context clear)
+# and instruct agent accordingly.
+
+# --- 0. Ensure base skills exist ---
+# lang-* skills are dependencies of coding-skill-selector — only copied together with it.
+# If user deletes a lang-* skill, it stays deleted until coding-skill-selector is also removed.
+SKILLS_SRC="${CLAUDE_PLUGIN_ROOT}/templates/skills"
+SKILLS_DST="$HOME/.claude/skills"
+if [ -d "$SKILLS_SRC" ]; then
+  mkdir -p "$SKILLS_DST"
+  COPY_LANG=false
+  [ ! -d "$SKILLS_DST/coding-skill-selector" ] && COPY_LANG=true
+  for skill_dir in "$SKILLS_SRC"/*/; do
+    [ -d "$skill_dir" ] || continue
+    skill_name=$(basename "$skill_dir")
+    if [ "$COPY_LANG" = false ] && [[ "$skill_name" == lang-* ]]; then continue; fi
+    if [ ! -d "$SKILLS_DST/$skill_name" ]; then
+      cp -r "$skill_dir" "$SKILLS_DST/$skill_name"
+    fi
+  done
+fi
+
+ZED_SUFFIX=""
+if [[ -n "$ZED_ENVIRONMENT" ]]; then
+  ZED_SUFFIX=" Then load skill ide-zed (Skill tool)."
+fi
+
+STATE_DIR="${STATE_DIR:-$HOME/.claude/workflow-state}"
+
+# Every SessionStart is a fresh context, and the server outlives all but
+# `startup` (clear, compact and an in-REPL resume/fork keep the process): a new
+# marker value makes it forget which digest_on_repeat prompts it already
+# delivered (src/tools.ts). At startup it only clears an empty set.
+mkdir -p "$STATE_DIR" && echo "$(date +%s).$$" > "$STATE_DIR/context-epoch-$PPID"
+
+# A crashed Claude Code never runs SessionEnd, so its markers stay behind:
+# drop every marker whose pid is no longer alive (never this instance's own).
+for marker in "$STATE_DIR"/context-epoch-* "$STATE_DIR"/claude-session-*; do
+  [ -f "$marker" ] || continue
+  marker_pid=${marker##*-}
+  [ "$marker_pid" = "$PPID" ] && continue
+  case "$marker_pid" in ''|*[!0-9]*) continue ;; esac
+  kill -0 "$marker_pid" 2>/dev/null || rm -f "$marker"
+done
+
+# Everything below requires jq — without it, still emit the fresh-start prompt.
+command -v jq >/dev/null 2>&1 || { echo "STOP. Call mcp__plugin_workflow_wf__start (no args) first.$ZED_SUFFIX"; exit 0; }
+
+read -t 1 -r INPUT
+SOURCE=$(echo "$INPUT" | jq -r '.source // empty')
+CONVERSATION=$(echo "$INPUT" | jq -r '.session_id // empty')
+# The conversation this process runs: the server stamps it on every session it
+# starts (src/engine.ts), so a later `claude --resume` finds them.
+[ -n "$CONVERSATION" ] && printf '%s\n' "$CONVERSATION" > "$STATE_DIR/claude-session-$PPID"
+TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+HOOK_CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+# Physical path (pwd -P) so a symlinked cwd (e.g. /tmp → /private/tmp)
+# compares equal to the engine's getcwd()-resolved context.cwd.
+HOOK_CWD=$(cd "${HOOK_CWD:-$PWD}" 2>/dev/null && pwd -P || echo "$PWD")
+PLANS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plans"
+
+# Session IDs are 8 hex chars; the {7,} length filter skips shorter incidental hex words.
+SID_RE='[a-f0-9]{7,}'
+
+# --- Helper: the engine's session CLI (src/session-cli.ts) — writes under the
+# engine's own file locks; fails (and the caller falls back) without a build or node.
+SESSION_CLI="${CLAUDE_PLUGIN_ROOT}/build/session-cli.js"
+session_cli() {
+  [ -f "$SESSION_CLI" ] && command -v node >/dev/null 2>&1 && node "$SESSION_CLI" "$@" 2>/dev/null
+}
+
+# --- Helper: apply a jq filter to a file in place (atomic tmp+rename) ---
+# $$ makes the temp name unique per hook instance, so concurrent hooks
+# cannot clobber each other's half-written temp files.
+jq_inplace() {
+  local filter="$1" f="$2" tmp="$2.tmp.$$"
+  jq "$filter" "$f" 2>/dev/null > "$tmp" && mv "$tmp" "$f" || rm -f "$tmp"
+}
+
+# --- Helper: check <sid> refers to a live planning session ---
+# Live = state file exists + top stack frame is "planning" + not abandoned.
+validate_planning_session() {
+  local sf="$STATE_DIR/$1.json"
+  [ -f "$sf" ] || return 1
+  jq -e '.outcome != "abandoned" and (.stack | length > 0) and .stack[-1].workflow == "planning"' "$sf" >/dev/null 2>&1
+}
+
+# --- Helper: increment skill_epoch in a session JSON by ID ---
+bump_skill_epoch_by_id() {
+  local sf="$STATE_DIR/$1.json"
+  [ -f "$sf" ] || return
+  jq_inplace '.skill_epoch = ((.skill_epoch // 0) + 1)' "$sf"
+}
+
+# --- Helper: increment skill_epoch in active sessions for current PID ---
+bump_skill_epoch_by_pid() {
+  [ -d "$STATE_DIR" ] || return
+  # $PPID is the Claude Code process: hook commands run as single-command
+  # `bash -c` invocations, which bash exec-optimizes (the shell replaces
+  # itself), so no intermediate shell sits between this script and Claude Code.
+  local cc_pid=$PPID
+  for sf in "$STATE_DIR"/*.json; do
+    [ -f "$sf" ] || continue
+    local pid
+    pid=$(jq -r '.context.claude_code_pid // empty' "$sf" 2>/dev/null)
+    [ "$pid" = "$cc_pid" ] || continue
+    jq_inplace 'if .stack | length > 0 then .skill_epoch = ((.skill_epoch // 0) + 1) else . end' "$sf"
+  done
+}
+
+# --- Helper: find a live planning session for this project from plan files ---
+# Only plans whose session context.cwd matches the hook's cwd are considered;
+# candidates are checked newest-first by plan file mtime.
+find_plan_session() {
+  [ -d "$PLANS_DIR" ] || return
+  local plan sid
+  while IFS= read -r plan; do
+    [ -f "$plan" ] || continue
+    # Session ID from the ## Workflow section. -A5: the Session line is looked
+    # for only in the 5 lines after the heading.
+    sid=$(grep -A5 '^## Workflow' "$plan" | grep 'Session' | grep -oE "$SID_RE" | head -1)
+    [ -n "$sid" ] || continue
+    validate_planning_session "$sid" || continue
+    [ "$(jq -r '.context.cwd // empty' "$STATE_DIR/${sid}.json" 2>/dev/null)" = "$HOOK_CWD" ] || continue
+    echo "$sid"
+    return
+  done < <(ls -t "$PLANS_DIR"/*.md 2>/dev/null)
+}
+
+# --- 1. clear/compact → same process, context lost ---
+if [ "$SOURCE" = "clear" ] || [ "$SOURCE" = "compact" ]; then
+  # Transcript grep is only used to recover the planning session hex;
+  # validity is checked against the state file, not the transcript.
+  if [ -n "$TRANSCRIPT" ] && grep -q 'ExitPlanMode' "$TRANSCRIPT" 2>/dev/null; then
+    PLAN_SID=$(grep -oE 'transition\(\\"[a-f0-9]+\\"' "$TRANSCRIPT" | tail -1 | grep -oE "$SID_RE")
+    if [ -n "$PLAN_SID" ] && validate_planning_session "$PLAN_SID"; then
+      bump_skill_epoch_by_id "$PLAN_SID"
+      echo "PLAN RESUME (same process): call transition(\"$PLAN_SID\", \"planned\") to resume planning session.$ZED_SUFFIX"
+      exit 0
+    fi
+  fi
+  bump_skill_epoch_by_pid
+  # The hook's output is part of the new context: name the sessions this
+  # process is in, so a compacted orchestrator knows where it is.
+  ACTIVE=$(session_cli active "$STATE_DIR" "$PPID")
+  echo "Context was cleared. Call status() to check for active session and restore context.$ZED_SUFFIX"
+  [ -n "$ACTIVE" ] && printf '%s\n' "$ACTIVE"
+  exit 0
+fi
+
+# --- 2. startup/resume → new process ---
+# A resumed conversation picks up its own sessions — suspended by the previous
+# process's SessionEnd (hooks/workflow-cleanup.sh) or left by a crash — with
+# their sub-trees: the same conversation id makes them this process's by right.
+# Without the CLI: list the suspended roots for an explicit resume().
+if [ "$SOURCE" = "resume" ] && [ -n "$CONVERSATION" ]; then
+  if PICKED=$(session_cli pickup "$STATE_DIR" "$CONVERSATION" "$PPID") && [ -n "$PICKED" ]; then
+    echo "$PICKED$ZED_SUFFIX"
+    exit 0
+  fi
+  SUSPENDED=$(jq -r --arg conv "$CONVERSATION" '
+    select(.claude_session_id == $conv and (.stack | length > 0) and .suspended_at != null)
+    | [.session_id, (.parent_session_id // ""), (.stack[.active_frame] | "\(.workflow) @ \(.current_state)")] | join("|")
+  ' "$STATE_DIR"/*.json 2>/dev/null)
+  if [ -n "$SUSPENDED" ]; then
+    SUSPENDED_IDS=" $(printf '%s\n' "$SUSPENDED" | cut -d'|' -f1 | tr '\n' ' ')"
+    LINES=""
+    # `|`, not a tab: whitespace IFS would fold an empty parent field away
+    while IFS='|' read -r sid parent where; do
+      [ -n "$parent" ] && [[ "$SUSPENDED_IDS" == *" $parent "* ]] && continue
+      LINES="$LINES
+  $sid: $where → mcp__plugin_workflow_wf__resume({ session_id: \"$sid\" })"
+    done <<< "$SUSPENDED"
+    echo "WORKFLOW SESSIONS SUSPENDED when this conversation's previous process exited — do NOT call start(). Resume each:$LINES
+resume() returns the session's current state (an exec that was running is taken over) and names the sub-agents to wake.$ZED_SUFFIX"
+    exit 0
+  fi
+fi
+
+# Check plans/ for live planning sessions (cross-process plan resume)
+PLAN_SID=$(find_plan_session)
+if [ -n "$PLAN_SID" ]; then
+  bump_skill_epoch_by_id "$PLAN_SID"
+  echo "PLAN RESUME (new process): active planning session $PLAN_SID found. Call mcp__plugin_workflow_wf__resume({ session_id: \"$PLAN_SID\" }), then transition(\"$PLAN_SID\", \"planned\") to resume.$ZED_SUFFIX"
+  exit 0
+fi
+
+# --- 3. Nothing found → fresh start ---
+echo "STOP. Call mcp__plugin_workflow_wf__start (no args) first.$ZED_SUFFIX"

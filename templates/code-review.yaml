@@ -1,0 +1,383 @@
+name: code-review
+description: "Code review workflow"
+initial: overview
+max_transitions: 300
+
+states:
+  overview:
+    task: "Review the changes overview"
+    prompt: |
+      Do these steps in order, then transition `understood`:
+
+      **Step 1 — Determine file source (first match wins):**
+
+      1. **User specified files** — user named concrete file paths → use those.
+         Do NOT touch git.
+      2. **User specified directories** — user named directories or patterns
+         (e.g. "src/api/", "src/ without editor", "src/*.hx, src/api/, src/drill/").
+         Parse the request in natural language:
+         - `"src/"` → all source files recursively, auto-group by first-level subdirectories
+         - `"src/api/, src/drill/"` → only these dirs recursively, each = one package
+         - `"src/*.hx, src/api/, src/drill/"` → root files + specific dirs
+         - `"src/ without editor and video"` → everything except excluded dirs
+         Use Glob to build the final file list. Group files by parent directory into packages.
+         Save via `context_set(key: "review_mode", value: "directory")`.
+         Save via `context_set(key: "packages", value: "<JSON array>")` where format is:
+         `[{"name": "api", "files": ["src/api/Foo.hx", ...]}, {"name": "root", "files": [...]}]`
+         Save via `context_set(key: "current_package_index", value: "0")`.
+      3. **Called as sub-workflow after testing/coding** — you already know which files
+         were changed from conversation history. Use that knowledge directly.
+      4. **Starting fresh with no prior context** — check git status for uncommitted
+         changes (staged or unstaged). If none → ask the user.
+      - NEVER default to `git diff master` or full branch diff
+
+      **Step 2 — Determine review depth:**
+      - Coming from testing/coding / "check changes" / "review diff" / default
+        → `scope: diff` (only review changed lines)
+      - "review file" / "check whole file" / "bring to order" (or equivalent
+        phrases in the user's language) → `scope: full` (review entire file)
+      - Directory mode → always `scope: full`
+      Save the scope via `context_set(key: "review_scope", value: "diff" or "full")`.
+
+      **Step 3 — Get file names:**
+      - If source is user-specified files or directories → already have the list.
+      - If source is git → get ALL changed file names (modified AND new/untracked):
+        - Modified/staged: `git diff HEAD --name-only --diff-filter=d`
+          (lowercase `d` excludes deleted files)
+        - New untracked: `git ls-files --others --exclude-standard`
+        Combine both lists. Do NOT read full diffs yet — names only.
+        Deleted files (`git diff HEAD --name-only --diff-filter=D`) get NO
+        per-file review — note them for the cross-file step instead
+        (their callers/imports may break).
+        **Git pathspec gotcha (zsh):** to exclude paths, use `-- . ':(exclude)path'`,
+        NOT `-- ':!path'` — the latter silently returns empty results in zsh.
+
+      Output the file list (and packages if directory mode), then → transition `understood`.
+    transitions:
+      understood: load_skills
+
+  load_skills:
+    skills:
+      - coding-skill-selector
+      - ?project-skill-selector
+    transitions:
+      continue: deep_review
+
+  deep_review:
+    task: "Route review by scope"
+    prompt: |
+      Check context key `review_mode`:
+      - If `review_mode` is `"directory"` → `directory`
+
+      Otherwise route by SIZE of what will actually be REVIEWED:
+      - `diff` scope → size = changed lines (`git diff HEAD --numstat`);
+        `full` scope → size = the whole file (`wc -l`), since that is what
+        gets read.
+      - `single` → TRIVIAL: ≤2 files AND ≤~50 lines to review — the linter
+        IS the review (lint-review sub-workflow: engine-run lint + act on
+        findings + one intent re-read).
+      - `multi` → everything else, EVEN a single batch: an agent buys fresh
+        eyes and keeps review bulk out of this session's context;
+        parallelism is a bonus, not the criterion.
+    transitions:
+      single: review_single
+      multi: review_delegate
+      directory: package_review
+
+  review_single:
+    sub_workflow: lint-review
+    on_complete: cross_file
+    on_fail: cross_file
+
+  review_delegate:
+    task: "Deep per-file review via agents"
+    prompt: |
+      CRITICAL: You are a DISPATCHER in this state, not a reviewer.
+      Do NOT read diffs, files, or code CONTENT yourself. Structure and size
+      queries needed for batching ARE dispatcher-legal: `git diff HEAD
+      --numstat`, `git status`, and hxq graph queries (`importers`/`callees`).
+      Your ONLY job is to group, spawn Agent tools, and collect results.
+
+      Group the changed files into LOGICAL BATCHES, then spawn one Agent per
+      BATCH for deep review. Use `subagent_type="general-purpose"`.
+      Batching amortizes each agent's fixed cost (skill loading) AND lets one
+      reviewer see coupled files together — it is the default, not an option.
+
+      Batching rules (strongest tie wins; a file joins exactly one batch):
+      1. A source file and its test always share a batch.
+      2. Files coupled by the change — caller+callee, interface+its
+         implementations, type+its consumers. For .hx with hxq available,
+         derive coupling structurally over the changed set:
+         `hxq importers <module> <scope>` / `hxq callees 'Type.method' <scope>`.
+      3. Remaining files group by directory/module.
+      4. Size cap: at most 5 files AND roughly 500 changed lines per batch;
+         a file exceeding that alone gets its own agent. A batch of one is fine.
+
+      For each batch, include in the agent prompt VERBATIM:
+      ---
+      IMPORTANT: Override the default CLAUDE.md rule about start().
+      Do NOT call start() without arguments.
+      Instead, your FIRST action must be:
+        mcp__plugin_workflow_wf__start({ workflow: "file-review", parent_session_id: "<SESSION_ID>" })
+      where <SESSION_ID> is the current session ID (substitute it before sending).
+      Then follow the file-review workflow states until completion.
+      start() returns `SESSION: <id>` — pass that session_id explicitly in every
+      subsequent workflow tool call (transition, context_set); parallel siblings
+      share the same ppid.
+      ---
+      Also include:
+      - The batch's file list (absolute paths) and WHY they are grouped
+        (test-of, calls, same module) — the reviewer checks those seams too
+      - Per file, whether it is modified or new (untracked):
+        - Modified: "Get the diff with: `git diff HEAD -- <filepath>`"
+        - New/untracked: "This is a new file — read the entire file and review all code."
+      - The review scope (from context key `review_scope`):
+        - `diff` → "Review ONLY the changed lines (or all code if new file). Report pre-existing issues separately as 'pre-existing' severity, do NOT mix with diff issues."
+        - `full` → "Review the ENTIRE file for all issues, not just the diff."
+      - "Report with one section per file, plus a batch-level section for
+        cross-file findings within the batch."
+
+      Do NOT include style rules, review checklists, or coding preferences in the agent prompt.
+      The file-review workflow has its own skill-loading state — agents will load all
+      relevant skills themselves. Manual rule lists are lossy and cause missed issues.
+
+      ALWAYS pass an explicit `model` to the Agent tool — never let a spawn
+      silently inherit the session model: `sonnet` for batches whose
+      mechanics the linter covers (.hx with hxq) and routine code; `opus`
+      for macro-heavy / engine-critical / no-linter batches. Never silent session-model inheritance; pass `effort` too (task-delegation table); fable only on user request.
+
+      Launch up to 8 batch agents in ONE message, each with
+      `run_in_background: false` — reports gate the merge; a single batch
+      is still a gating single, not a background task. More batches →
+      next wave after the current one completes.
+      Collect their reports.
+
+      If a child agent fails or returns no report — re-spawn it once;
+      if it fails again, mark that batch's files as unreviewed in the summary.
+
+      After ALL reports are collected:
+      1. Abort orphaned child workflow sessions — call `sessions` to find
+         any active `file-review` sessions that are children of this session,
+         then `abort` each one. Agents may finish without reaching
+         the terminal workflow state, leaving zombie sessions behind.
+      2. Immediately transition `done`. Do not stop to report status.
+    transitions:
+      done: cross_file
+
+  package_review:
+    task: "Review current package (batch loop)"
+    prompt: |
+      CRITICAL: You are a DISPATCHER in this state, not a reviewer.
+      Do NOT read files or code yourself — only spawn agents and collect results.
+
+      1. Your package list and position, embedded from context (re-rendered on
+         every visit — survives context compression; if they look stale, call
+         `status()` and re-read context):
+         - packages: {{context.packages}}
+         - current_package_index: {{context.current_package_index}}
+      2. If `current_package_index` >= number of packages → transition `all_done`.
+      3. Take the current package. Output: "**Package: <name>** (<N> files)".
+      4. Group the package's files into LOGICAL BATCHES — same rules as
+         review_delegate: source+test together, import/call coupling
+         (for .hx via `hxq importers`/`callees`), then by subdirectory;
+         cap 5 files per batch, oversized files (≈ >500 lines) solo.
+      5. Spawn one Agent per BATCH for deep review.
+         Use `subagent_type="general-purpose"`.
+
+         For each batch, include in the agent prompt VERBATIM:
+         ---
+         IMPORTANT: Override the default CLAUDE.md rule about start().
+         Do NOT call start() without arguments.
+         Instead, your FIRST action must be:
+           mcp__plugin_workflow_wf__start({ workflow: "file-review", parent_session_id: "<SESSION_ID>" })
+         where <SESSION_ID> is the current session ID (substitute it before sending).
+         Then follow the file-review workflow states until completion.
+         start() returns `SESSION: <id>` — pass that session_id explicitly in every
+         subsequent workflow tool call (transition, context_set); parallel siblings
+         share the same ppid.
+         ---
+         Also include:
+         - The batch's file list (absolute paths) and why they are grouped
+         - "Review the ENTIRE file for all issues (scope: full) — read the whole
+           file. Report one section per file + a batch-level cross-file section."
+
+         Do NOT include style rules or coding preferences — agents load their own skills.
+
+         ALWAYS pass an explicit `model`: `sonnet` for linter-covered/routine
+         batches, `opus` for complex/no-linter ones. Never silent session-model inheritance;
+         pass `effort` too (task-delegation table); fable only on user request.
+
+         Launch up to 8 batch agents in ONE message, each with
+         `run_in_background: false` — reports gate the package report; a
+         single batch is still a gating single, not a background task.
+         More batches → next wave after the current completes.
+         If a child agent fails or returns no report — re-spawn it once;
+         if it fails again, mark that batch's files as unreviewed in the package report.
+
+      6. Collect all reports for this package. Save to context:
+         `context_set(key: "package_<index>_report", value: "<aggregated report>")`
+      7. Abort orphaned child workflow sessions for this package.
+      8. Increment: `context_set(key: "current_package_index", value: "<next index>")`
+      9. Transition `next_package` to process the next package.
+    transitions:
+      next_package: package_review
+      all_done: cross_file
+
+  cross_file:
+    task: "Cross-file analysis"
+    prompt: |
+      Now look at the big picture. Seams WITHIN a batch are already covered
+      by that batch agent's cross-file section — do not re-derive them;
+      focus on seams BETWEEN batches and on set-wide patterns (these apply
+      even when there was only one batch):
+
+      **Cross-file consistency:**
+      - [ ] Duplication across files: did different files introduce similar code?
+      - [ ] Missing updates: if an interface/type changed, are all consumers updated?
+      - [ ] Consistency: do the changes follow the same patterns across files?
+      - [ ] Test coverage: are changed behaviors covered by tests? Missing test files?
+      - [ ] Integration: do the changed components work together correctly?
+      - [ ] Blast radius: are there callers/dependents that weren't updated?
+
+      **Architecture:**
+      - [ ] Duplicate abstractions: similar classes/interfaces across files that should be unified
+      - [ ] Common logic: repeated patterns across files that should be extracted
+      - [ ] Unnecessary coupling: modules depending on each other's internals
+      - [ ] Classes to merge: tiny classes that always appear together and share state
+      - [ ] Layer violations: data flowing through unnecessary intermediary layers
+
+      Add any cross-file findings to the review. Then → transition `done`.
+    transitions:
+      done: summarize
+
+  summarize:
+    task: "Summarize review findings"
+    prompt: |
+      Aggregate all findings from per-file reviews and cross-file analysis.
+      Categorize every finding into one of two buckets:
+
+      **Obvious fixes** — ONLY cosmetic changes that do NOT alter code behavior:
+      formatting, naming, dead code removal, unused imports, comment fixes, typos in strings.
+      A fix is obvious ONLY if the code does exactly the same thing before and after.
+
+      **Debatable concerns** — EVERYTHING that changes functionality, even if "clearly better":
+      refactoring logic, changing conditions, restructuring data flow, removing/adding calls,
+      changing API signatures, fixing bugs (bug fixes change behavior!), adding error handling,
+      architectural choices, alternative approaches, trade-offs.
+
+      **Rule: when in doubt, it's debatable, not obvious.**
+
+      Present the summary clearly with both buckets. If there are no issues at all → `approve`.
+      If there are any issues → `has_issues`.
+    transitions:
+      approve: done
+      has_issues: apply_fixes
+
+  apply_fixes:
+    task: "Apply obvious fixes"
+    prompt: |
+      Apply ONLY cosmetic fixes from the "obvious" bucket — formatting, naming,
+      dead code, unused imports, comment fixes, typos.
+
+      **STOP and move to debatable** if you realize a fix changes what the code does,
+      even subtly. Removing a seemingly-dead code path, reordering operations,
+      changing error handling — these are NOT obvious.
+
+      Do NOT touch debatable concerns — those go to discussion.
+
+      After fixing, route:
+      - You made code changes → `changes_made`
+      - No changes, but there are debatable concerns → `has_concerns`
+      - No changes and no debatable concerns → `all_clear`
+    transitions:
+      changes_made: verify_build
+      has_concerns: discuss
+      all_clear: done
+
+  verify_build:
+    task: "Verify build after obvious fixes"
+    prompt: |
+      Code was changed — verify the project still builds.
+
+      Run the project's build/compile command. Check for errors.
+      - Build fails → fix the build errors, then run the build again.
+        Repeat until the build passes.
+
+      After build passes, route:
+      - There are debatable concerns remaining → `has_concerns`
+      - No debatable concerns → `all_clear`
+    transitions:
+      has_concerns: discuss
+      all_clear: done
+
+  discuss:
+    task: "Discuss debatable concerns"
+    prompt: |
+      Present ALL debatable concerns to the user as a numbered list. For each one, explain:
+      - What the current code does
+      - What the concern is
+      - Your suggestion (if any)
+      - Whether the change affects functionality (if yes — it will need testing)
+
+      **CRITICAL: Resolve EVERY item before transitioning.**
+      Stay in this state until the user has given a decision on each concern:
+      fix, skip, or needs more investigation. If the user asks to investigate
+      a specific item — do the research here, present findings, get a decision.
+      Do NOT transition out to fix one item and leave others unresolved.
+
+      Before `plan` or `code`: `context_set(key: "review_base", value: <sha>)` — <sha> = the output of
+      `git stash create` (a snapshot of the dirty tree; the tree itself is
+      untouched), or — when it prints nothing (clean tree) — a fresh commit of
+      HEAD's tree: `git commit-tree "HEAD^{tree}" -p HEAD -m review-base`
+      (a dangling object: no branch or ref changes, nothing enters history;
+      its date lets review routing skip files that predate this round;
+      `git rev-parse HEAD` only if commit-tree fails).
+      coding's review then covers only the agreed changes, not the code this
+      review already covered.
+
+      Only after ALL items have a decision, route based on scope of agreed changes:
+      - Many changes / architectural / multi-file refactoring → `plan` (enters planning mode)
+      - Few small stylistic or localized fixes → `code` (direct coding)
+      - User decided to change nothing on ALL items → `skip`
+    transitions:
+      plan: plan_changes
+      code: code_changes
+      skip: done
+
+  plan_changes:
+    task: "Plan agreed changes"
+    sub_workflow: planning
+    on_complete: code_changes
+    on_fail: done
+
+  code_changes:
+    task: "Apply agreed changes"
+    sub_workflow: coding
+    on_complete: verify_impact
+    on_fail: done
+
+  verify_impact:
+    task: "Verify build, tests, and cross-file impact"
+    prompt: |
+      Code was changed after discussion — verify correctness and impact.
+
+      1. Run the project's build/compile command. Fix errors and rebuild until green.
+
+      2. Run tests for changed behavior. If no automated tests cover the change,
+         describe what manual testing is needed and ask the user to verify.
+         Cosmetic-only changes → build passing is sufficient.
+
+      3. Cross-file impact check: for each file modified during discussion,
+         identify other files in the original review set that use its changed
+         APIs/symbols. Quickly inspect those call sites for compile-time or
+         obvious behavior breakage. This is NOT a full re-review — only check
+         consumers of what changed.
+
+      After verification, transition `complete`. The coding sub-workflow already
+      reviewed the files it modified.
+    transitions:
+      complete: done
+
+  done:
+    prompt: "Review complete."
+    terminal: true

@@ -1,0 +1,48 @@
+name: new-feature
+description: "New feature implementation workflow"
+initial: check_plan
+max_transitions: 80
+
+states:
+  check_plan:
+    prompt: |
+      ROUTING STATE — decide where to start based on plan status.
+
+      - A plan for this feature was already approved in this conversation
+        → transition `have_plan` (skip straight to implementation).
+      - No approved plan yet → transition `no_plan` (clarify requirements,
+        then plan).
+    transitions:
+      have_plan: implement
+      no_plan: requirements
+
+  requirements:
+    task: "Clarify requirements"
+    prompt: |
+      Clarify requirements with the user. What exactly should this feature do?
+
+      If the request is unambiguous → transition `clear` without asking anything.
+
+      **Do NOT explore the codebase here** — no Read, Grep, Glob, or Explore agents.
+      Only ask the user questions. Codebase exploration happens in the planning phase.
+    transitions:
+      clear: plan
+
+  plan:
+    sub_workflow: planning
+    on_complete: implement
+    on_fail: requirements
+
+  implement:
+    sub_workflow: coding
+    on_complete: done
+    on_fail: failed
+
+  done:
+    prompt: "Feature implemented, tested, and reviewed."
+    terminal: true
+    outcome: complete
+
+  failed:
+    terminal: true
+    outcome: fail

@@ -1,0 +1,1469 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
+import { Engine } from "./engine.js";
+import { Executor } from "./executor.js";
+import { formatStatus } from "./tools.js";
+import {
+  InMemoryStorage,
+  createTestLoader,
+  createFixtureDir,
+  cleanupDir,
+  SIMPLE_WORKFLOW,
+  MULTI_STATE_WORKFLOW,
+} from "./test-helpers.js";
+import { Loader } from "./loader.js";
+import type { ActionResult } from "./types.js";
+import { KEEP_TERMINAL_SESSIONS } from "./types.js";
+
+describe("Engine", () => {
+  let storage: InMemoryStorage;
+  let loader: Loader;
+  let executor: Executor;
+  let engine: Engine;
+  let dir: string;
+
+  function setup(workflows: Record<string, object>) {
+    storage = new InMemoryStorage();
+    const result = createTestLoader(workflows);
+    loader = result.loader;
+    dir = result.dir;
+    executor = new Executor();
+    engine = new Engine(storage, loader, executor);
+  }
+
+  afterEach(() => {
+    if (dir) cleanupDir(dir);
+  });
+
+  describe("start", () => {
+    it("creates session with initial state prompt", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      const result = await engine.start("simple");
+
+      expect(result.sessionId).toHaveLength(8);
+      expect(result.currentStateName).toBe("start");
+      expect(result.currentWorkflow).toBe("simple");
+      expect(result.prompt).toBe("Start state");
+      expect(result.availableTransitions).toEqual({ next: "end" });
+      expect(result.stack).toHaveLength(1);
+    });
+
+    it("throws for unknown workflow", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      await expect(engine.start("nonexistent")).rejects.toThrow("not found");
+    });
+  });
+
+  describe("transition", () => {
+    it("transitions A → B", async () => {
+      setup({ multi: MULTI_STATE_WORKFLOW });
+      const { sessionId } = await engine.start("multi");
+
+      const result = await engine.transition(sessionId, "go_b");
+      expect(result.currentStateName).toBe("b");
+      expect(result.prompt).toBe("State B");
+    });
+
+    it("rejects unknown transition name", async () => {
+      setup({ multi: MULTI_STATE_WORKFLOW });
+      const { sessionId } = await engine.start("multi");
+
+      await expect(engine.transition(sessionId, "nonexistent")).rejects.toThrow("not available");
+    });
+
+    it("enforces max_transitions", async () => {
+      setup({
+        limited: {
+          initial: "a",
+          max_transitions: 2,
+          states: {
+            a: { prompt: "A", transitions: { go: "b" } },
+            b: { prompt: "B", transitions: { go: "a" } },
+            end: { terminal: true, prompt: "Done", outcome: "complete" },
+          },
+        },
+      });
+
+      const { sessionId } = await engine.start("limited");
+      await engine.transition(sessionId, "go"); // a→b (1)
+      await engine.transition(sessionId, "go"); // b→a (2)
+      await expect(engine.transition(sessionId, "go")).rejects.toThrow("Max transitions");
+    });
+
+    it("at the cap only a move that closes the run is accepted, and the status warns within 5%", async () => {
+      setup({
+        looped: {
+          initial: "a",
+          max_transitions: 20,
+          states: {
+            a: { prompt: "A", transitions: { go: "b", stop: "report" } },
+            b: { prompt: "B", transitions: { go: "a" } },
+            report: { prompt: "R", transitions: { done: "end" } },
+            end: { terminal: true, prompt: "Done", outcome: "complete" },
+          },
+        },
+      });
+      const { sessionId } = await engine.start("looped");
+      for (let i = 0; i < 17; i++) await engine.transition(sessionId, "go");
+      expect((await engine.transition(sessionId, "go")).capWarning).toBeUndefined(); // 18 of 20: 2 left
+      const near = await engine.transition(sessionId, "go"); // 19 of 20: 1 left
+      expect(near.capWarning).toContain("19 of 20");
+      const at = await engine.transition(sessionId, "go"); // 20 of 20
+      expect(at.capWarning).toContain("none left");
+      expect(formatStatus(at)).toContain("WARNING: 20 of 20");
+      await expect(engine.transition(sessionId, "go")).rejects.toThrow("Max transitions");
+      await engine.transition(sessionId, "stop");
+      const closed = await engine.transition(sessionId, "done");
+      expect(closed.capWarning).toBeUndefined();
+      expect(engine.getStatus(sessionId).capWarning).toBeUndefined();
+    });
+
+    const gateAtCap = (to: string) => ({
+      gated: {
+        initial: "a",
+        max_transitions: 3,
+        states: {
+          a: { prompt: "A", transitions: { go: "g1" } },
+          g1: { skills: ["s"], transitions: { continue: "a2" } },
+          a2: { prompt: "A2", transitions: { go: "g2" } },
+          g2: { skills: ["s"], transitions: { continue: to } },
+          end: { terminal: true, prompt: "Done", outcome: "complete" },
+        },
+      },
+    });
+
+    it("a skill gate's auto-move at the cap proceeds into a closing target", async () => {
+      setup(gateAtCap("end"));
+      const { sessionId } = await engine.start("gated");
+      await engine.transition(sessionId, "go");
+      await engine.transition(sessionId, "continue");
+      const r = await engine.transition(sessionId, "go"); // 3 of 3, g2 auto-passes
+      expect(r.stack).toHaveLength(0);
+    });
+
+    it("a skill gate's auto-move at the cap into a loop state is refused", async () => {
+      setup(gateAtCap("a"));
+      const { sessionId } = await engine.start("gated");
+      await engine.transition(sessionId, "go");
+      await engine.transition(sessionId, "continue");
+      await expect(engine.transition(sessionId, "go")).rejects.toThrow("Max transitions");
+    });
+
+    it("an exec route at the cap: into a terminal proceeds, into a loop state is refused", async () => {
+      const wf = (to: string) => ({
+        act: {
+          initial: "a",
+          max_transitions: 1,
+          states: {
+            a: { prompt: "A", transitions: { go: "run" } },
+            run: { type: "exec", command: "true", on_success: to, on_error: to },
+            again: { prompt: "again", transitions: { back: "a" } },
+            end: { terminal: true, prompt: "Done", outcome: "complete" },
+          },
+        },
+      });
+      setup(wf("end"));
+      let { sessionId } = await engine.start("act");
+      expect((await engine.transition(sessionId, "go")).stack).toHaveLength(0);
+      setup(wf("again"));
+      ({ sessionId } = await engine.start("act"));
+      await expect(engine.transition(sessionId, "go")).rejects.toThrow("Max transitions");
+    });
+
+    it("no warning far from the cap", async () => {
+      setup({ multi: MULTI_STATE_WORKFLOW });
+      const { sessionId } = await engine.start("multi");
+      expect(engine.getStatus(sessionId).capWarning).toBeUndefined();
+    });
+
+    it("enforces max_visits", async () => {
+      setup({
+        visits: {
+          initial: "a",
+          states: {
+            a: { prompt: "A", transitions: { go: "b" } },
+            b: { prompt: "B", transitions: { back: "a" }, max_visits: 2 },
+            end: { terminal: true, prompt: "Done", outcome: "complete" },
+          },
+        },
+      });
+
+      const { sessionId } = await engine.start("visits");
+      await engine.transition(sessionId, "go"); // a→b (visit 1)
+      await engine.transition(sessionId, "back"); // b→a
+      await engine.transition(sessionId, "go"); // a→b (visit 2)
+      await engine.transition(sessionId, "back"); // b→a
+      await expect(engine.transition(sessionId, "go")).rejects.toThrow("max_visits");
+    });
+
+    it("terminal state pops stack (single frame = complete)", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      const { sessionId } = await engine.start("simple");
+
+      const result = await engine.transition(sessionId, "next");
+      expect(result.stack).toHaveLength(0);
+      expect(result.prompt).toContain("completed");
+    });
+
+    it("retains the completed session for history", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      const { sessionId } = await engine.start("simple");
+
+      await engine.transition(sessionId, "next");
+
+      const persisted = storage.read(sessionId);
+      expect(persisted?.stack).toHaveLength(0);
+      expect(persisted?.outcome).toBe("completed");
+    });
+
+    it("keeps only the newest KEEP_TERMINAL_SESSIONS terminal sessions", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      for (let i = 0; i < KEEP_TERMINAL_SESSIONS + 2; i++) {
+        const { sessionId } = await engine.start("simple");
+        await engine.transition(sessionId, "next");
+      }
+
+      const all = storage.readAll();
+      expect(all).toHaveLength(KEEP_TERMINAL_SESSIONS);
+      expect(all.every(s => s.stack.length === 0)).toBe(true);
+    });
+
+    it("completing a parent after its children finished prunes terminal sessions once down to KEEP_TERMINAL_SESSIONS", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+
+      // Parent with several children. The engine blocks parent completion
+      // while children are active, so each child finishes first; then the
+      // parent completes and _pruneTerminal runs once over all the now-terminal
+      // sessions (children + parent).
+      const parent = await engine.start("simple");
+      const childCount = KEEP_TERMINAL_SESSIONS + 4;
+      for (let i = 0; i < childCount; i++) {
+        const child = await engine.start("simple", undefined, parent.sessionId);
+        await engine.transition(child.sessionId, "next");
+      }
+
+      await engine.transition(parent.sessionId, "next");
+
+      const all = storage.readAll();
+      expect(all).toHaveLength(KEEP_TERMINAL_SESSIONS);
+      expect(all.every(s => s.stack.length === 0)).toBe(true);
+    });
+
+    it("aborting a parent with multiple children prunes terminal sessions once down to KEEP_TERMINAL_SESSIONS", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+
+      for (let i = 0; i < KEEP_TERMINAL_SESSIONS; i++) {
+        const { sessionId } = await engine.start("simple");
+        await engine.transition(sessionId, "next");
+      }
+
+      const parent = await engine.start("simple");
+      const childCount = KEEP_TERMINAL_SESSIONS + 4;
+      for (let i = 0; i < childCount; i++) {
+        await engine.start("simple", undefined, parent.sessionId);
+      }
+
+      await engine.abort(parent.sessionId);
+
+      const all = storage.readAll();
+      expect(all).toHaveLength(KEEP_TERMINAL_SESSIONS);
+      expect(all.every(s => s.stack.length === 0)).toBe(true);
+    });
+  });
+
+  describe("sub_workflow", () => {
+    it("pushes sub_workflow on transition", async () => {
+      setup({
+        parent: {
+          initial: "start",
+          states: {
+            start: {
+              sub_workflow: "child",
+              on_complete: "done",
+              on_fail: "done",
+            },
+            done: { terminal: true, prompt: "Parent done", outcome: "complete" },
+          },
+        },
+        child: {
+          initial: "work",
+          states: {
+            work: { prompt: "Child work", transitions: { finish: "end" } },
+            end: { terminal: true, prompt: "Child done", outcome: "complete" },
+          },
+        },
+      });
+
+      const result = await engine.start("parent");
+      // Should auto-push into child workflow
+      expect(result.stack).toHaveLength(2);
+      expect(result.currentWorkflow).toBe("child");
+      expect(result.currentStateName).toBe("work");
+    });
+
+    it("a push history entry names the state it enters and the pushed workflow", async () => {
+      setup({
+        parent: {
+          initial: "start",
+          states: {
+            start: { sub_workflow: "child", on_complete: "done", on_fail: "done" },
+            done: { terminal: true, prompt: "Parent done", outcome: "complete" },
+          },
+        },
+        child: {
+          initial: "work",
+          states: {
+            work: { prompt: "Child work", transitions: { finish: "end" } },
+            end: { terminal: true, prompt: "Child done", outcome: "complete" },
+          },
+        },
+      });
+      const result = await engine.start("parent");
+      const push = storage.read(result.sessionId)!.history.find(h => h.event === "push");
+      expect(push).toMatchObject({ frame: 1, workflow: "child", to: "work" });
+    });
+
+    it("pops back to parent on child completion", async () => {
+      setup({
+        parent: {
+          initial: "start",
+          states: {
+            start: {
+              sub_workflow: "child",
+              on_complete: "done",
+              on_fail: "done",
+            },
+            done: { terminal: true, prompt: "Parent done", outcome: "complete" },
+          },
+        },
+        child: {
+          initial: "work",
+          states: {
+            work: { prompt: "Child work", transitions: { finish: "end" } },
+            end: { terminal: true, prompt: "Child done", outcome: "complete" },
+          },
+        },
+      });
+
+      const { sessionId } = await engine.start("parent");
+      // In child → transition to terminal
+      const result = await engine.transition(sessionId, "finish");
+      // Should pop child, move parent to "done" (terminal), then complete
+      expect(result.stack).toHaveLength(0);
+      expect(result.prompt).toContain("completed");
+    });
+  });
+
+  describe("action states", () => {
+    it("auto-executes and routes on_success", async () => {
+      setup({
+        act: {
+          initial: "run",
+          states: {
+            run: {
+              type: "exec",
+              command: "echo hello",
+              on_success: "ok",
+              on_error: "fail",
+            },
+            ok: { prompt: "Success!", terminal: true, outcome: "complete" },
+            fail: { prompt: "Failed!", terminal: true, outcome: "fail" },
+          },
+        },
+      });
+
+      const result = await engine.start("act");
+      // Should auto-execute, route to "ok", then pop (terminal)
+      expect(result.stack).toHaveLength(0);
+      expect(result.prompt).toContain("completed");
+    });
+
+    it("routes on_error for failed command", async () => {
+      setup({
+        act: {
+          initial: "run",
+          states: {
+            run: {
+              type: "exec",
+              command: "exit 1",
+              on_success: "ok",
+              on_error: "recover",
+            },
+            ok: { prompt: "Success!", terminal: true, outcome: "complete" },
+            recover: { prompt: "Something went wrong", terminal: true, outcome: "fail" },
+          },
+        },
+      });
+
+      const result = await engine.start("act");
+      // Should auto-execute, fail, route to "recover" which is terminal
+      expect(result.stack).toHaveLength(0);
+    });
+
+    it("exposes active-frame visits and root_workflow to action states", async () => {
+      setup({
+        parent: {
+          initial: "go",
+          states: {
+            go: { sub_workflow: "child", on_complete: "end" },
+            end: { terminal: true, outcome: "complete" },
+          },
+        },
+        child: {
+          initial: "a",
+          states: {
+            a: { prompt: "A", transitions: { again: "a", next: "probe" } },
+            probe: {
+              type: "exec",
+              command: 'echo "$V|$R|$G"',
+              env: { V: "{{visits.a}}", R: "{{root_workflow}}", G: "{{visits.go}}" },
+              on_success: "show",
+              on_error: "show",
+              success_prompt: "{{stdout}}",
+            },
+            show: { prompt: "show", transitions: { done: "fin" } },
+            fin: { terminal: true, outcome: "complete" },
+          },
+        },
+      });
+
+      const { sessionId } = await engine.start("parent");
+      await engine.transition(sessionId, "again");
+      const result = await engine.transition(sessionId, "next");
+      // visits.go belongs to the parent frame — not visible from the child
+      expect(result.prompt.trim()).toBe("2|parent|");
+    });
+
+    it("chains exec→exec→prompt", async () => {
+      setup({
+        chain: {
+          initial: "step1",
+          states: {
+            step1: {
+              type: "exec",
+              command: "echo one",
+              on_success: "step2",
+              on_error: "fail",
+            },
+            step2: {
+              type: "exec",
+              command: "echo two",
+              on_success: "done",
+              on_error: "fail",
+            },
+            done: { prompt: "All steps done", transitions: { finish: "end" } },
+            fail: { prompt: "Failed", terminal: true, outcome: "fail" },
+            end: { terminal: true, prompt: "Ended", outcome: "complete" },
+          },
+        },
+      });
+
+      const result = await engine.start("chain");
+      // step1 → step2 → done (prompt state, stops chain)
+      expect(result.currentStateName).toBe("done");
+      expect(result.prompt).toBe("All steps done");
+    });
+
+    it("routes using cases + default", async () => {
+      setup({
+        cases: {
+          initial: "check",
+          states: {
+            check: {
+              type: "exec",
+              command: "exit 2",
+              cases: { "0": "ok", "1": "warn" },
+              default: "error",
+            },
+            ok: { prompt: "OK", terminal: true, outcome: "complete" },
+            warn: { prompt: "Warning", terminal: true, outcome: "complete" },
+            error: { prompt: "Error", terminal: true, outcome: "fail" },
+          },
+        },
+      });
+
+      const result = await engine.start("cases");
+      // exit 2 → not in cases → default "error"
+      expect(result.stack).toHaveLength(0);
+    });
+
+    it("errors on action chain depth > 20", async () => {
+      // Build a chain of 25 exec states
+      const states: Record<string, object> = {};
+      for (let i = 0; i < 25; i++) {
+        states[`step${i}`] = {
+          type: "exec",
+          command: "echo ok",
+          on_success: i < 24 ? `step${i + 1}` : "end",
+          on_error: "end",
+        };
+      }
+      states.end = { terminal: true, prompt: "Done", outcome: "complete" };
+
+      setup({ deep: { initial: "step0", states } });
+
+      await expect(engine.start("deep")).rejects.toThrow("max depth");
+    });
+  });
+
+  describe("hard terminal prompts", () => {
+    it("delivers the terminal prompt on root completion", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      const { sessionId } = await engine.start("simple");
+
+      const result = await engine.transition(sessionId, "next");
+      expect(result.stack).toHaveLength(0);
+      expect(result.prompt).toBe("Done\n\n---\n\nWorkflow completed.");
+    });
+
+    it("delivers the sub-workflow terminal prompt plus the parent's next state prompt", async () => {
+      setup({
+        parent: {
+          initial: "start",
+          states: {
+            start: {
+              sub_workflow: "child",
+              on_complete: "review",
+              on_fail: "review",
+            },
+            review: { prompt: "Parent review", transitions: { done: "end" } },
+            end: { terminal: true, outcome: "complete" },
+          },
+        },
+        child: {
+          initial: "work",
+          states: {
+            work: { prompt: "Child work", transitions: { finish: "report" } },
+            report: { terminal: true, prompt: "Report your findings", outcome: "complete" },
+          },
+        },
+      });
+
+      const { sessionId } = await engine.start("parent");
+      const result = await engine.transition(sessionId, "finish");
+
+      expect(result.currentStateName).toBe("review");
+      expect(result.prompt).toBe("Report your findings\n\n---\n\nParent review");
+      // Prefixed prompt must bypass revisit compression in the tool formatter
+      expect(result.forcePrompt).toBe(true);
+    });
+
+    it("keeps current behavior for a terminal without prompt", async () => {
+      setup({
+        bare: {
+          initial: "start",
+          states: {
+            start: { prompt: "Start", transitions: { next: "end" } },
+            end: { terminal: true, outcome: "complete" },
+          },
+        },
+      });
+
+      const { sessionId } = await engine.start("bare");
+      const result = await engine.transition(sessionId, "next");
+
+      expect(result.stack).toHaveLength(0);
+      expect(result.prompt).toBe("Workflow completed.");
+    });
+  });
+
+  describe("resolveSessionId", () => {
+    it("resolves the single active session without an explicit id", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      const { sessionId } = await engine.start("simple");
+
+      expect(engine.resolveSessionId()).toBe(sessionId);
+    });
+
+    it("throws listing candidates when multiple sessions are active for this process", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      const parent = await engine.start("simple");
+      const child = await engine.start("simple", undefined, parent.sessionId);
+
+      expect(() => engine.resolveSessionId()).toThrow(parent.sessionId);
+      expect(() => engine.resolveSessionId()).toThrow(child.sessionId);
+      expect(() => engine.resolveSessionId()).toThrow("session_id");
+      // Explicit id passes through untouched despite the ambiguity
+      expect(engine.resolveSessionId(child.sessionId)).toBe(child.sessionId);
+    });
+  });
+
+  describe("GLOBAL_WORKFLOWS", () => {
+    it("excludes bundled workflows (github-init, docs, batch) from the project workflow list", async () => {
+      const bundled = ["github-init", "docs", "batch"];
+      setup({
+        hub: {
+          initial: "menu",
+          states: {
+            menu: {
+              prompt: "Choose a workflow.",
+              include_workflows: true,
+              transitions: { done: "end" },
+            },
+            end: { terminal: true, outcome: "complete" },
+          },
+        },
+        ...Object.fromEntries(bundled.map(name => [name, SIMPLE_WORKFLOW])),
+        "my-project-flow": SIMPLE_WORKFLOW,
+      });
+
+      const result = await engine.start("hub");
+      expect(result.prompt).toContain("my-project-flow");
+      for (const name of bundled) {
+        // Guard: the fixture actually loaded — otherwise not.toContain passes vacuously
+        expect(loader.get(name)).toBeTruthy();
+        expect(result.prompt).not.toContain(name);
+      }
+    });
+
+    it("lists no bundled template as a project workflow", async () => {
+      const fixtureDir = createFixtureDir({
+        hub: {
+          initial: "menu",
+          states: {
+            menu: {
+              prompt: "Choose a workflow.",
+              include_workflows: true,
+              transitions: { done: "end" },
+            },
+            end: { terminal: true, outcome: "complete" },
+          },
+        },
+        "my-project-flow": SIMPLE_WORKFLOW,
+      });
+      try {
+        const bundledDir = path.join(
+          path.dirname(fileURLToPath(import.meta.url)),
+          "..",
+          "templates",
+        );
+        const realEngine = new Engine(
+          new InMemoryStorage(),
+          new Loader(bundledDir, fixtureDir, null),
+          new Executor(),
+        );
+        const result = await realEngine.start("hub");
+        const listed = result.prompt
+          .split("Available workflows:\n")[1]
+          .split("\n")
+          .map(line => line.replace(/^- (\S+) — .*$/, "$1"));
+        // A new bundled template missing from GLOBAL_WORKFLOWS shows up here
+        expect(listed).toEqual(["hub", "my-project-flow"]);
+      } finally {
+        cleanupDir(fixtureDir);
+      }
+    });
+  });
+
+  describe("template rendering", () => {
+    it("renders {{context.X}} in prompts", async () => {
+      setup({
+        tpl: {
+          initial: "start",
+          states: {
+            start: {
+              prompt: "Working in {{context.cwd}}",
+              transitions: { done: "end" },
+            },
+            end: { terminal: true, prompt: "Done", outcome: "complete" },
+          },
+        },
+      });
+
+      const result = await engine.start("tpl");
+      // cwd is set to process.cwd() in engine.start()
+      expect(result.prompt).toContain(process.cwd());
+    });
+  });
+
+  describe("setContext", () => {
+    it("updates context and persists", async () => {
+      setup({ simple: SIMPLE_WORKFLOW });
+      const { sessionId } = await engine.start("simple");
+
+      await engine.setContext(sessionId, "foo", "bar");
+
+      const status = engine.getStatus(sessionId);
+      expect(status.context.foo).toBe("bar");
+    });
+  });
+
+  describe("abort", () => {
+    it("clears stack and sets outcome", async () => {
+      setup({ multi: MULTI_STATE_WORKFLOW });
+      const { sessionId } = await engine.start("multi");
+
+      await engine.abort(sessionId);
+
+      const status = engine.getStatus(sessionId);
+      expect(status.stack).toHaveLength(0);
+      expect(status.prompt).toContain("abandoned");
+    });
+
+    it("a parent abort during a child's exec is not overwritten when the exec returns", async () => {
+      setup({
+        parent: SIMPLE_WORKFLOW,
+        slow: {
+          initial: "start",
+          states: {
+            start: { prompt: "go", transitions: { next: "wait" } },
+            wait: { type: "exec", command: "sleep 0.3", on_success: "work", on_error: "work" },
+            work: { prompt: "working", transitions: { done: "end" } },
+            end: { terminal: true, outcome: "complete" },
+          },
+        },
+      });
+      const parent = await engine.start("parent");
+      const child = await engine.start("slow", undefined, parent.sessionId);
+
+      const running = engine.transition(child.sessionId, "next");
+      await engine.abort(parent.sessionId);
+
+      await expect(running).rejects.toThrow("ended while its action state ran");
+      const session = storage.read(child.sessionId)!;
+      expect(session.outcome).toBe("abandoned");
+      expect(session.stack).toHaveLength(0);
+    });
+
+    it("a context_set that lands during an exec survives the action chain's write", async () => {
+      setup({
+        slow: {
+          initial: "start",
+          states: {
+            start: { prompt: "go", transitions: { next: "wait" } },
+            wait: { type: "exec", command: "sleep 0.2", on_success: "work", on_error: "work" },
+            work: { prompt: "working", transitions: { done: "end" } },
+            end: { terminal: true, outcome: "complete" },
+          },
+        },
+      });
+      const { sessionId } = await engine.start("slow");
+
+      const running = engine.transition(sessionId, "next");
+      await engine.setContext(sessionId, "k", "v");
+      await running;
+
+      const session = storage.read(sessionId)!;
+      expect(session.stack[0].current_state).toBe("work");
+      expect(session.context.k).toBe("v");
+    });
+  });
+
+  describe("getStatus", () => {
+    it("returns current state info", async () => {
+      setup({ multi: MULTI_STATE_WORKFLOW });
+      const { sessionId } = await engine.start("multi");
+      await engine.transition(sessionId, "go_b");
+
+      const status = engine.getStatus(sessionId);
+      expect(status.currentStateName).toBe("b");
+      expect(status.currentWorkflow).toBe("multi");
+      expect(status.visitCount).toBe(1);
+    });
+  });
+});
+
+describe("Engine — session cwd, ids, outcome, accounting (ENG-1a)", () => {
+  let storage: InMemoryStorage;
+  let engine: Engine;
+  let dir: string;
+  const tmpDirs: string[] = [];
+
+  function setup(workflows: Record<string, object>) {
+    storage = new InMemoryStorage();
+    const result = createTestLoader(workflows);
+    dir = result.dir;
+    engine = new Engine(storage, result.loader, new Executor());
+  }
+  function tmpDir(): string {
+    const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "wf-eng1a-")));
+    tmpDirs.push(d);
+    return d;
+  }
+
+  afterEach(() => {
+    if (dir) cleanupDir(dir);
+    for (const d of tmpDirs.splice(0)) cleanupDir(d);
+  });
+
+  const PWD_WORKFLOW = {
+    initial: "start",
+    states: {
+      start: { prompt: "go", transitions: { next: "pwd" } },
+      pwd: {
+        type: "exec",
+        command: 'pwd -P; echo "$WF_SESSION_ID|$WF_PARENT_SESSION_ID|$WF_ROOT_SESSION_ID"',
+        on_success: "show",
+        on_error: "show",
+        success_prompt: "{{stdout}}",
+      },
+      show: {
+        prompt: "sid={{session_id}} parent={{parent_session_id}}",
+        transitions: { done: "end" },
+      },
+      end: { terminal: true, outcome: "complete" },
+    },
+  };
+
+  it("start cwd: an exec without its own cwd runs in the session's cwd", async () => {
+    setup({ pwd: PWD_WORKFLOW });
+    const worktree = tmpDir();
+    const { sessionId } = await engine.start("pwd", undefined, undefined, worktree);
+    expect(storage.read(sessionId)!.context.cwd).toBe(worktree);
+    const r = await engine.transition(sessionId, "next");
+    expect(r.prompt.split("\n")[0]).toBe(worktree);
+  });
+
+  it("start stores the project name: a removed worktree keeps its main checkout's name", async () => {
+    setup({ pwd: PWD_WORKFLOW });
+    const root = tmpDir();
+    const main = path.join(root, "repo");
+    const wt = path.join(root, "wf-SLICE");
+    fs.mkdirSync(path.join(main, ".git", "worktrees", "wf-SLICE"), { recursive: true });
+    fs.mkdirSync(wt);
+    fs.writeFileSync(path.join(wt, ".git"), `gitdir: ${main}/.git/worktrees/wf-SLICE\n`);
+    const { sessionId } = await engine.start("pwd", undefined, undefined, wt);
+    fs.rmSync(wt, { recursive: true });
+    expect(storage.read(sessionId)!.context.project).toBe("repo");
+  });
+
+  it("start cwd: a relative state cwd resolves against the session's cwd", async () => {
+    setup({
+      rel: {
+        initial: "run",
+        states: {
+          run: {
+            type: "exec",
+            command: "pwd -P",
+            cwd: "sub",
+            on_success: "show",
+            on_error: "show",
+            success_prompt: "{{stdout}}",
+          },
+          show: { prompt: "x", transitions: { done: "end" } },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const worktree = tmpDir();
+    fs.mkdirSync(path.join(worktree, "sub"));
+    const r = await engine.start("rel", undefined, undefined, worktree);
+    expect(r.prompt.trim()).toBe(path.join(worktree, "sub"));
+  });
+
+  it("start cwd: without the parameter the session keeps the server cwd", async () => {
+    setup({ simple: SIMPLE_WORKFLOW });
+    const { sessionId } = await engine.start("simple");
+    expect(storage.read(sessionId)!.context.cwd).toBe(process.cwd());
+  });
+
+  it("start cwd: a relative or missing directory is an error", async () => {
+    setup({ simple: SIMPLE_WORKFLOW });
+    await expect(engine.start("simple", undefined, undefined, "rel/dir")).rejects.toThrow(
+      "absolute",
+    );
+    await expect(
+      engine.start("simple", undefined, undefined, path.join(tmpDir(), "nope")),
+    ).rejects.toThrow("not an existing directory");
+    expect(storage.readAll()).toHaveLength(0);
+  });
+
+  it("ids: exec env and prompt templates carry session / parent / root ids", async () => {
+    setup({ pwd: PWD_WORKFLOW, simple: SIMPLE_WORKFLOW });
+    const root = await engine.start("simple");
+    const mid = await engine.start("simple", undefined, root.sessionId);
+    const child = await engine.start("pwd", undefined, mid.sessionId);
+    const r = await engine.transition(child.sessionId, "next");
+    expect(r.prompt.split("\n")[1]).toBe(`${child.sessionId}|${mid.sessionId}|${root.sessionId}`);
+    expect(engine.getStatus(child.sessionId).prompt).toBe(
+      `sid=${child.sessionId} parent=${mid.sessionId}`,
+    );
+
+    const solo = await engine.start("pwd", undefined, "unknownparent");
+    const s = await engine.transition(solo.sessionId, "next");
+    expect(s.prompt.split("\n")[1]).toBe(`${solo.sessionId}|unknownparent|unknownparent`);
+  });
+
+  it("ids: at the root WF_PARENT_SESSION_ID is empty and root id is the session's own", async () => {
+    setup({ pwd: PWD_WORKFLOW });
+    const { sessionId } = await engine.start("pwd");
+    const r = await engine.transition(sessionId, "next");
+    expect(r.prompt.split("\n")[1]).toBe(`${sessionId}||${sessionId}`);
+  });
+
+  it("outcome: a root session ending on a fail terminal stays failed", async () => {
+    setup({
+      f: {
+        initial: "start",
+        states: {
+          start: { prompt: "go", transitions: { give_up: "failed_end" } },
+          failed_end: { terminal: true, outcome: "fail" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("f");
+    const r = await engine.transition(sessionId, "give_up");
+    expect(r.currentStateName).toBe("(failed)");
+    const s = storage.read(sessionId)!;
+    expect(s.outcome).toBe("failed");
+    expect(s.history.at(-1)!.event).toBe("fail");
+    expect(engine.getStatus(sessionId).prompt).toBe("Workflow failed.");
+  });
+
+  it("outcome: a fail terminal popped through a sub_workflow keeps the root's own outcome", async () => {
+    setup({
+      parent: {
+        initial: "call",
+        states: {
+          call: { sub_workflow: "child", on_complete: "ok", on_fail: "bad" },
+          ok: { terminal: true, outcome: "complete" },
+          bad: { terminal: true, outcome: "fail" },
+        },
+      },
+      child: {
+        initial: "start",
+        states: {
+          start: { prompt: "c", transitions: { fail: "x" } },
+          x: { terminal: true, outcome: "fail" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("parent");
+    await engine.transition(sessionId, "fail");
+    expect(storage.read(sessionId)!.outcome).toBe("failed");
+  });
+
+  it("accounting: an exec history entry carries duration_ms and exit_code", async () => {
+    setup({
+      e: {
+        initial: "run",
+        states: {
+          run: { type: "exec", command: "sleep 0.05; exit 3", on_success: "end", on_error: "end" },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("e");
+    const entry = storage.read(sessionId)!.history.find(h => h.event === "action")!;
+    expect(entry.exit_code).toBe(3);
+    expect(entry.duration_ms).toBeGreaterThanOrEqual(40);
+  });
+
+  it("accounting: every session end appends one ledger line (complete, fail, abort, cascade)", async () => {
+    setup({
+      e: {
+        initial: "run",
+        states: {
+          run: { type: "exec", command: "true", on_success: "wait", on_error: "wait" },
+          wait: { prompt: "w", transitions: { ok: "end", bad: "failed_end" } },
+          end: { terminal: true, outcome: "complete" },
+          failed_end: { terminal: true, outcome: "fail" },
+        },
+      },
+    });
+    const a = await engine.start("e");
+    await engine.transition(a.sessionId, "ok");
+    const b = await engine.start("e");
+    await engine.transition(b.sessionId, "bad");
+    const c = await engine.start("e");
+    const cChild = await engine.start("e", undefined, c.sessionId);
+    await engine.abort(c.sessionId);
+
+    const ledger = storage.ledger as Array<Record<string, unknown>>;
+    expect(ledger.map(l => [l.session_id, l.outcome])).toEqual([
+      [a.sessionId, "completed"],
+      [b.sessionId, "failed"],
+      [c.sessionId, "abandoned"],
+      [cChild.sessionId, "abandoned"],
+    ]);
+    const first = ledger[0];
+    expect(first.workflow).toBe("e");
+    expect(first.parent_session_id).toBeNull();
+    expect(first.root_session_id).toBe(a.sessionId);
+    expect(first.transitions).toBe(2);
+    expect((first.execs as Array<{ state: string }>).map(x => x.state)).toEqual(["run"]);
+    expect(first.exec_ms_total).toBe(
+      (first.execs as Array<{ duration_ms: number }>)[0].duration_ms,
+    );
+    expect(typeof first.started_at).toBe("string");
+    expect(typeof first.ended_at).toBe("string");
+    expect(ledger[3].parent_session_id).toBe(c.sessionId);
+    expect(ledger[3].root_session_id).toBe(c.sessionId);
+  });
+
+  function pidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  async function waitDead(pid: number): Promise<boolean> {
+    for (let i = 0; i < 50 && pidAlive(pid); i++) await new Promise(r => setTimeout(r, 20));
+    return !pidAlive(pid);
+  }
+
+  it("abort kills a background exec's whole process group, not just its sh", async () => {
+    const work = tmpDir();
+    const pidFile = path.join(work, "grandchild.pid");
+    setup({
+      bg: {
+        initial: "run",
+        states: {
+          run: {
+            type: "exec",
+            background: true,
+            command: `sleep 30 & echo $! > "${pidFile}"; wait`,
+            on_success: "wait",
+            on_error: "wait",
+          },
+          wait: { prompt: "w", transitions: { done: "end" } },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("bg");
+    for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++)
+      await new Promise(r => setTimeout(r, 20));
+    const grandchild = Number(fs.readFileSync(pidFile, "utf8").trim());
+    expect(pidAlive(grandchild)).toBe(true);
+    await engine.abort(sessionId);
+    expect(await waitDead(grandchild)).toBe(true);
+  });
+
+  it("a parent's abort kills a child's in-flight foreground exec group", async () => {
+    const work = tmpDir();
+    const pidFile = path.join(work, "fg.pid");
+    setup({
+      simple: SIMPLE_WORKFLOW,
+      fg: {
+        initial: "start",
+        states: {
+          start: { prompt: "go", transitions: { next: "run" } },
+          run: {
+            type: "exec",
+            timeout: 60_000,
+            command: `sleep 30 & echo $! > "${pidFile}"; wait`,
+            on_success: "end",
+            on_error: "end",
+          },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const parent = await engine.start("simple");
+    const child = await engine.start("fg", undefined, parent.sessionId);
+    const running = engine.transition(child.sessionId, "next").catch(e => e as Error);
+    for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++)
+      await new Promise(r => setTimeout(r, 20));
+    const grandchild = Number(fs.readFileSync(pidFile, "utf8").trim());
+    await engine.abort(parent.sessionId);
+    expect(await waitDead(grandchild)).toBe(true);
+    const outcome = await running;
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("ended while its action state ran");
+  }, 10_000);
+});
+
+describe("Engine — ENG-1a review fixes", () => {
+  let storage: InMemoryStorage;
+  let engine: Engine;
+  let dir: string;
+  afterEach(() => {
+    if (dir) cleanupDir(dir);
+    vi.restoreAllMocks();
+  });
+
+  function setup(workflows: Record<string, object>) {
+    storage = new InMemoryStorage();
+    const result = createTestLoader(workflows);
+    dir = result.dir;
+    engine = new Engine(storage, result.loader, new Executor());
+  }
+
+  it("abort of an already-ended session is a no-op: no second ledger line, no outcome rewrite, no kill", async () => {
+    setup({
+      f: {
+        initial: "start",
+        states: {
+          start: { prompt: "go", transitions: { give_up: "bad" } },
+          bad: { terminal: true, outcome: "fail" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("f");
+    await engine.transition(sessionId, "give_up");
+    const ended = storage.read(sessionId)!;
+    await storage.write(sessionId, { ...ended, background_pids: { "old:1": 424242 } });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    await engine.abort(sessionId);
+
+    expect(kill).not.toHaveBeenCalled();
+    expect(storage.read(sessionId)!.outcome).toBe("failed");
+    expect(storage.ledger).toHaveLength(1);
+  });
+
+  it("a legacy child without root_session_id gets ONE root everywhere: its parent", async () => {
+    setup({
+      simple: SIMPLE_WORKFLOW,
+      env: {
+        initial: "start",
+        states: {
+          start: { prompt: "go", transitions: { next: "run" } },
+          run: {
+            type: "exec",
+            command: 'echo "$WF_ROOT_SESSION_ID"',
+            on_success: "show",
+            on_error: "show",
+            success_prompt: "{{stdout}}",
+          },
+          show: { prompt: "x", transitions: { done: "end" } },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const parent = await engine.start("simple");
+    const child = await engine.start("env", undefined, parent.sessionId);
+    const { root_session_id: _drop, ...legacy } = storage.read(child.sessionId)!;
+    await storage.write(child.sessionId, legacy);
+
+    const r = await engine.transition(child.sessionId, "next");
+    expect(r.prompt.trim()).toBe(parent.sessionId);
+    await engine.transition(child.sessionId, "done");
+    expect((storage.ledger.at(-1) as { root_session_id: string }).root_session_id).toBe(
+      parent.sessionId,
+    );
+  });
+});
+
+describe("Engine — ENG-1d: on_exhausted, action results in later states", () => {
+  let storage: InMemoryStorage;
+  let engine: Engine;
+  let dir: string | undefined;
+
+  function setup(workflows: Record<string, object>) {
+    storage = new InMemoryStorage();
+    const result = createTestLoader(workflows);
+    dir = result.dir;
+    engine = new Engine(storage, result.loader, new Executor());
+  }
+  afterEach(() => {
+    if (dir) cleanupDir(dir);
+    dir = undefined;
+  });
+
+  it("a transition past max_visits enters on_exhausted and records why", async () => {
+    setup({
+      loop: {
+        initial: "a",
+        states: {
+          a: { prompt: "A", transitions: { go: "b" } },
+          b: {
+            prompt: "B {{visits.b}}",
+            transitions: { back: "a" },
+            max_visits: 2,
+            on_exhausted: "giveup",
+          },
+          giveup: { prompt: "gave up after {{visits.b}}", transitions: { done: "end" } },
+          end: { terminal: true, outcome: "fail" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("loop");
+    expect((await engine.transition(sessionId, "go")).prompt).toBe("B 1");
+    await engine.transition(sessionId, "back");
+    expect((await engine.transition(sessionId, "go")).prompt).toBe("B 2");
+    await engine.transition(sessionId, "back");
+    const r = await engine.transition(sessionId, "go");
+    expect(r.currentStateName).toBe("giveup");
+    expect(r.prompt).toBe("gave up after 2");
+    const s = storage.read(sessionId)!;
+    expect(s.stack[0].state_visits.b).toBe(2);
+    expect(s.history.at(-1)).toMatchObject({
+      from: "a",
+      to: "giveup",
+      via: "go",
+      detail: "max_visits exhausted: b → giveup",
+    });
+  });
+
+  it("an action state's route past max_visits enters on_exhausted with no agent turn", async () => {
+    setup({
+      fixloop: {
+        initial: "start",
+        states: {
+          start: { prompt: "go", transitions: { verify: "check" } },
+          check: {
+            type: "exec",
+            command: "exit 1",
+            on_success: "end",
+            on_error: "fix",
+            error_prompt: "failed, fix it",
+          },
+          fix: {
+            prompt: "fix #{{visits.fix}}",
+            transitions: { retry: "check" },
+            max_visits: 2,
+            on_exhausted: "escalate",
+          },
+          escalate: { prompt: "escalate (exit {{exit_code}})", transitions: { done: "end" } },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("fixloop");
+    expect((await engine.transition(sessionId, "verify")).prompt).toBe("failed, fix it");
+    expect((await engine.transition(sessionId, "retry")).prompt).toBe("failed, fix it");
+    const r = await engine.transition(sessionId, "retry");
+    expect(r.currentStateName).toBe("escalate");
+    // the error_prompt was written for fix: the rerouted move shows escalate's own prompt
+    expect(r.prompt).toBe("escalate (exit 1)");
+    expect(storage.read(sessionId)!.history.at(-1)).toMatchObject({
+      event: "action",
+      from: "check",
+      to: "escalate",
+      detail: "exit 1; max_visits exhausted: fix → escalate",
+    });
+  });
+
+  it("a skill gate's auto-transition past max_visits enters on_exhausted", async () => {
+    setup({
+      gated: {
+        initial: "a",
+        states: {
+          a: { prompt: "A", transitions: { go: "gate" } },
+          gate: { skills: ["s"], transitions: { continue: "work" } },
+          work: { prompt: "W", transitions: { again: "a" }, max_visits: 1, on_exhausted: "stop" },
+          stop: { prompt: "stopped", transitions: { done: "end" } },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("gated");
+    await engine.transition(sessionId, "go"); // gate: skill missing
+    await engine.transition(sessionId, "continue"); // gate → work (visit 1), skill now loaded
+    await engine.transition(sessionId, "again");
+    const r = await engine.transition(sessionId, "go"); // gate auto-passes → work exhausted
+    expect(r.currentStateName).toBe("stop");
+  });
+
+  it("follows chained on_exhausted routes; refuses a route cycle and a state without the route", async () => {
+    setup({
+      chain: {
+        initial: "a",
+        states: {
+          a: { prompt: "A", transitions: { go: "b", loop: "x" } },
+          b: { prompt: "B", transitions: { back: "a", c: "c" }, max_visits: 1, on_exhausted: "c" },
+          c: { prompt: "C", transitions: { back: "a" }, max_visits: 1, on_exhausted: "d" },
+          d: { prompt: "D", transitions: { back: "a", cap: "cap" } },
+          x: { prompt: "X", transitions: { back: "a" }, max_visits: 1, on_exhausted: "y" },
+          y: { prompt: "Y", transitions: { back: "a" }, max_visits: 1, on_exhausted: "x" },
+          cap: { prompt: "cap", transitions: { back: "a" }, max_visits: 1 },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const { sessionId } = await engine.start("chain");
+    await engine.transition(sessionId, "go");
+    await engine.transition(sessionId, "c");
+    await engine.transition(sessionId, "back");
+    const r = await engine.transition(sessionId, "go");
+    expect(r.currentStateName).toBe("d");
+    expect(storage.read(sessionId)!.history.at(-1)!.detail).toBe("max_visits exhausted: b, c → d");
+
+    await engine.transition(sessionId, "back");
+    await engine.transition(sessionId, "loop"); // x (visit 1)
+    await engine.transition(sessionId, "back");
+    // x exhausted → y (first visit) is fine
+    expect((await engine.transition(sessionId, "loop")).currentStateName).toBe("y");
+    await engine.transition(sessionId, "back");
+    await expect(engine.transition(sessionId, "loop")).rejects.toThrow(
+      "on_exhausted routes loop: x → y → x",
+    );
+
+    await engine.transition(sessionId, "go"); // → d
+    await engine.transition(sessionId, "cap");
+    await engine.transition(sessionId, "back");
+    await engine.transition(sessionId, "go");
+    await expect(engine.transition(sessionId, "cap")).rejects.toThrow(
+      'State "cap" max_visits (1) exceeded',
+    );
+  });
+
+  it("{{stdout}} / {{exit_code}} reach the next prompt state and persist until the next action runs", async () => {
+    setup({
+      results: {
+        initial: "run",
+        states: {
+          run: {
+            type: "exec",
+            command: "echo out; echo err >&2; exit 3",
+            on_success: "seen",
+            on_error: "seen",
+          },
+          seen: {
+            prompt: "code={{exit_code}} out={{stdout}} err={{stderr}}",
+            transitions: { next: "later" },
+          },
+          later: { prompt: "still {{exit_code}}", transitions: { rerun: "probe" } },
+          probe: {
+            type: "exec",
+            command: 'echo "prev=$P"',
+            env: { P: "{{exit_code}}" },
+            on_success: "after",
+            on_error: "after",
+          },
+          after: { prompt: "now {{exit_code}}: {{stdout}}", transitions: { done: "end" } },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const first = await engine.start("results");
+    expect(first.currentStateName).toBe("seen");
+    expect(first.prompt).toBe("code=3 out=out\n err=err\n");
+    const { sessionId } = first;
+    expect(storage.read(sessionId)!.last_action_result).toMatchObject({
+      type: "exec",
+      exit_code: 3,
+      stdout: "out\n",
+    });
+    expect((await engine.transition(sessionId, "next")).prompt).toBe("still 3");
+    expect((await engine.transition(sessionId, "rerun")).prompt).toBe("now 0: prev=3\n");
+  });
+
+  it("revisit_prompt renders the latest exec's {{stdout}} on a revisit instead of the Revisit line", async () => {
+    setup({
+      revisit: {
+        initial: "run1",
+        states: {
+          run1: { type: "exec", command: "echo first", on_success: "seen", on_error: "seen" },
+          seen: {
+            prompt: "Full steps for {{stdout}}",
+            revisit_prompt: "Admitted: {{stdout}}",
+            transitions: { again: "run2" },
+          },
+          run2: { type: "exec", command: "echo second", on_success: "seen", on_error: "seen" },
+          end: { terminal: true, outcome: "complete" },
+        },
+      },
+    });
+    const first = await engine.start("revisit");
+    expect(formatStatus(first)).toContain("Full steps for first");
+    const again = await engine.transition(first.sessionId, "again");
+    const out = formatStatus(again);
+    expect(out).toContain("Admitted: second");
+    expect(out).not.toContain("Revisit #");
+  });
+});
+
+describe("Engine: a session started in another project", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const d of roots.splice(0)) cleanupDir(d);
+  });
+  function tmpDir(): string {
+    const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "wf-proj-")));
+    roots.push(d);
+    return d;
+  }
+  function writeWorkflows(dir: string, workflows: Record<string, object>): void {
+    const src = createFixtureDir(workflows);
+    roots.push(src);
+    fs.cpSync(src, dir, { recursive: true });
+  }
+  /** A git project (a `.git` dir) under a fresh temp root, with `workflows` in its `.claude/workflows/`. */
+  function project(name: string, workflows?: Record<string, object>): string {
+    const proj = path.join(tmpDir(), name);
+    fs.mkdirSync(path.join(proj, ".git"), { recursive: true });
+    if (workflows) writeWorkflows(path.join(proj, ".claude", "workflows"), workflows);
+    return proj;
+  }
+  const flow = (prompt: string) => ({
+    initial: "a",
+    states: { a: { prompt, transitions: { go: "end" } }, end: { terminal: true } },
+  });
+  /** A server over global `simple` + `shared` and its own project's `server-only` + `shared`. */
+  function server(globalDir?: string) {
+    const global = globalDir ?? tmpDir();
+    writeWorkflows(global, { simple: SIMPLE_WORKFLOW, shared: flow("GLOBAL") });
+    const serverProject = project("server", {
+      "server-only": flow("SERVER-ONLY"),
+      shared: flow("SERVER"),
+    });
+    const loader = new Loader(null, global, path.join(serverProject, ".claude", "workflows"));
+    const storage = new InMemoryStorage();
+    return { loader, storage, engine: new Engine(storage, loader, new Executor()) };
+  }
+
+  it("sees that project's own workflows over the server's, also from a subdir or a worktree; the server's stay visible", async () => {
+    const { engine } = server();
+    const other = project("other", { mine: MULTI_STATE_WORKFLOW, shared: flow("OTHER") });
+    const sub = path.join(other, "src");
+    fs.mkdirSync(sub);
+    const wt = path.join(path.dirname(other), "wt");
+    fs.mkdirSync(wt);
+    fs.writeFileSync(path.join(wt, ".git"), `gitdir: ${other}/.git/worktrees/wt\n`);
+
+    await expect(engine.start("mine", undefined, "p0")).rejects.toThrow("not found");
+    expect((await engine.start("shared", undefined, "p0")).prompt).toBe("SERVER");
+    for (const cwd of [other, sub, wt]) {
+      const s = await engine.start("mine", undefined, "p0", cwd);
+      expect((await engine.transition(s.sessionId, "go_b")).currentStateName).toBe("b");
+      expect((await engine.start("shared", undefined, "p0", cwd)).prompt).toBe("OTHER");
+    }
+    // a name only the server's project or the global tier has is still found from there
+    expect((await engine.start("server-only", undefined, "p0", other)).prompt).toBe("SERVER-ONLY");
+    expect((await engine.start("simple", undefined, "p0", other)).currentWorkflow).toBe("simple");
+
+    // a project without workflows of its own sees the server's, and gets no directory made
+    const bare = project("bare");
+    expect((await engine.start("shared", undefined, "p0", bare)).prompt).toBe("SERVER");
+    await expect(engine.start("mine", undefined, "p0", bare)).rejects.toThrow("not found");
+    expect(fs.existsSync(path.join(bare, ".claude"))).toBe(false);
+  });
+
+  it("a cwd whose .claude/workflows is the global dir (the home dir) is no project of its own", async () => {
+    const home = tmpDir();
+    const { engine } = server(path.join(home, ".claude", "workflows"));
+    expect((await engine.start("shared", undefined, "p0", home)).prompt).toBe("SERVER");
+    expect((await engine.start("server-only", undefined, "p0", home)).prompt).toBe("SERVER-ONLY");
+  });
+
+  it("a server holding no snapshot of the session (resume, a taken-over exec, a plain call) uses the session's project", async () => {
+    const { loader, storage, engine } = server();
+    const other = project("other", {
+      shared: {
+        initial: "a",
+        states: {
+          a: { prompt: "OTHER", transitions: { go: "end", run: "gate" } },
+          gate: { type: "exec", command: "echo other-gate", on_success: "end", on_error: "end" },
+          end: { terminal: true, prompt: "OTHER END" },
+        },
+      },
+    });
+    const restart = () => new Engine(storage, loader, new Executor());
+
+    const resumed = await engine.start("shared", undefined, "p0", other);
+    await engine.suspend(resumed.sessionId);
+    expect((await restart().resume(resumed.sessionId)).status.prompt).toBe("OTHER");
+
+    const orphan = await engine.start("shared", undefined, "p1", other);
+    const s = storage.read(orphan.sessionId)!;
+    const at = new Date().toISOString();
+    await storage.write(orphan.sessionId, {
+      ...s,
+      stack: [{ ...s.stack[0], current_state: "gate" }],
+      pending_action: { frame: 0, state: "gate", at },
+    });
+    const adopted = await restart().adoptOrphanedExec(orphan.sessionId);
+    expect(adopted?.prompt).toContain("OTHER END");
+
+    const plain = await engine.start("shared", undefined, "p2", other);
+    expect((await restart().transition(plain.sessionId, "go")).prompt).toContain("OTHER END");
+  });
+});
